@@ -8,12 +8,13 @@ import {
   setMboxRerender, mboxLoad, mboxPage, mboxFilter, mboxToggle, mboxImport,
   mboxRemove, mboxDelete, mboxSelection, mboxVerify, mboxStop, mboxOnOauthDone, mboxRunning, mboxCurrent, mboxStats,
   mboxSelectAll, mboxSelectNone, mboxToggleRow, mboxExport, mboxRetryFailed, mboxDismissResult, mboxUpdateLine, mboxReauth,
-  mboxSkipCurrent,
+  mboxSkipCurrent, mboxSetConcurrency,
 } from "./mbox.js";
 
 const $app = document.getElementById("app");
 let state = null;
 let renaming = null;
+let acctSel = new Set();
 let busy = false;
 let appVer = "";
 let autostart = false;
@@ -71,8 +72,14 @@ function idLabel(id) {
   return id.display_name || id.username || id.email || null;
 }
 
+function pruneAcctSel(s) {
+  const live = new Set((s?.accounts || []).map((a) => a.id));
+  for (const id of [...acctSel]) if (!live.has(id)) acctSel.delete(id);
+}
+
 async function refresh() {
   state = await invoke("get_state");
+  pruneAcctSel(state);
   if (state?.language) init(state.language);
   autostart = await invoke("autostart_status").catch(() => false);
   relay = await invoke("relay_status").catch(() => relay);
@@ -167,7 +174,8 @@ const actions = {
   async refresh() { await refresh(); render(); },
 
   async refreshQuota() {
-    if (!state?.accounts?.length) return;
+    await refresh().catch(() => {});
+    if (!state?.accounts?.length) { render(); return; }
     toast(t("st.refreshing"), "ok");
     for (const a of state.accounts) {
       acctQuota[a.id] = { data: acctQuota[a.id]?.data, busy: false };
@@ -266,7 +274,50 @@ const actions = {
   async doDelete(id) {
     await guard(async () => {
       await invoke("delete_account", { id });
+      acctSel.delete(id);
       toast(t("m.toastDeleted"));
+      await refresh(); render();
+    });
+  },
+
+  acctSelectAll(on) {
+    if (!state) return;
+    for (const a of filteredAccounts(state)) {
+      if (on) acctSel.add(a.id);
+      else acctSel.delete(a.id);
+    }
+    render();
+  },
+
+  acctSelectNone() {
+    acctSel.clear();
+    render();
+  },
+
+  async deleteSelected() {
+    const ids = [...acctSel];
+    if (!ids.length) return;
+    const names = ids
+      .map((id) => state?.accounts.find((x) => x.id === id)?.name || id)
+      .slice(0, 6)
+      .map(esc)
+      .join("<br>");
+    const more = ids.length > 6 ? `<br>${esc(t("mb.deleteListMore", { n: ids.length - 6 }))}` : "";
+    openConfirmModal({
+      kind: "danger",
+      icon: "trash",
+      title: t("m.deleteManyTitle", { n: ids.length }),
+      desc: `${esc(t("m.deleteDesc"))}<br><br>${names}${more}`,
+      yesLabel: t("common.delete"),
+      onYes: () => actions.doDeleteSelected(ids),
+    });
+  },
+
+  async doDeleteSelected(ids) {
+    await guard(async () => {
+      const r = await invoke("delete_accounts", { ids });
+      for (const id of ids) acctSel.delete(id);
+      toast(t("m.toastDeletedMany", { n: r?.deleted ?? ids.length }), "ok");
       await refresh(); render();
     });
   },
@@ -764,7 +815,7 @@ function quotaBarHtml(pct) {
   const remaining = used == null ? null : 100 - used;
   const danger = used != null && used >= 90 ? " danger" : used != null && used >= 70 ? " warn" : "";
   const txt = remaining == null ? "--" : remaining.toFixed(0) + "%";
-  return `<div class="qbar${danger}"><div class="qbar-fill" style="width:${remaining ?? 100}%"></div></div><span class="qbar-pct">${txt}</span>`;
+  return `<div class="qbar${danger}"><div class="qbar-fill" style="width:${remaining ?? 0}%"></div></div><span class="qbar-pct">${txt}</span>`;
 }
 
 function itemKind(it) {
@@ -1023,6 +1074,7 @@ function rowHtml(a) {
   <div class="row${isActive ? " active" : ""}" data-id="${a.id}">
     <div class="row-top">
       <span class="notch" style="background:${notchColor(a.id)}"></span>
+      <input type="checkbox" class="cbx acct-check" aria-label="${esc(a.name)}" data-id="${esc(a.id)}" ${acctSel.has(a.id) ? "checked" : ""}>
       <div class="row-main">
         <div class="row-name">${esc(a.name)}${providerBadge(a)}${tierBadgeFor(a.id)}${isActive ? `<span class="tag-use">${t("btn.inUse")}</span>` : ""}${a.has_user_info === false ? `<span class="tag-relogin" title="${esc(t("btn.reloginTitle"))}">${t("btn.relogin")}</span>` : ""}</div>
         <div class="row-meta">${meta}</div>
@@ -1064,10 +1116,17 @@ function filteredAccounts(s) {
   return q ? s.accounts.filter((a) => accountMatches(a, q)) : s.accounts;
 }
 
+function acctSelAllOn(rows) {
+  return rows.length > 0 && rows.every((a) => acctSel.has(a.id));
+}
+
 function applyFilter() {
   if (!state) return;
+  const rows = filteredAccounts(state);
   const main = $app.querySelector(".account-list .group");
-  if (main) main.innerHTML = listHtmlFor(state, filteredAccounts(state));
+  if (main) main.innerHTML = listHtmlFor(state, rows);
+  const allCb = $app.querySelector("#acct-all");
+  if (allCb) allCb.checked = acctSelAllOn(rows);
 }
 
 function quotaWindowRank(it) {
@@ -1165,11 +1224,11 @@ function statsHtml(s) {
   const active = s.accounts.find((a) => a.is_active) || null;
   const sumRem = models.reduce((a, m) => a + (m.remaining || 0), 0);
   const sumTot = models.reduce((a, m) => a + (m.total || 0), 0);
-  const sumPct = sumTot ? (sumRem / sumTot) * 100 : 100;
+  const sumPct = sumTot ? (sumRem / sumTot) * 100 : 0;
   const gauges = models
     .slice(0, 8)
     .map((m) => {
-      const rem = m.total ? (m.remaining / m.total) * 100 : m.n ? 100 - m.pctSum / m.n : 100;
+      const rem = m.total ? (m.remaining / m.total) * 100 : m.n ? 100 - m.pctSum / m.n : 0;
       const cls = rem <= 10 ? " danger" : rem <= 30 ? " warn" : "";
       const sub = m.total ? `${fmtTokens(m.total)}` : t("st.noTotal");
       return `<div class="mgauge">
@@ -1371,7 +1430,8 @@ function render() {
   } else if (tab === "proxy") {
     body = proxyView();
   } else {
-    const listHtml = listHtmlFor(s, filteredAccounts(s));
+    const filteredList = filteredAccounts(s);
+    const listHtml = listHtmlFor(s, filteredList);
     const claimableCount = s.accounts.filter((a) => (claimable[a.id]?.plans || []).length > 0).length;
     body = `
       <div class="content-h">
@@ -1398,6 +1458,7 @@ function render() {
         <button class="btn-ghost has-ic" click="actions.addAccount()" title="${t("btn.addAccountTitle")}">${ic("userPlus", 16)} ${t("btn.addAccount")}</button>
         <button class="btn-ghost has-ic" click="actions.importFiles()" title="${t("s.importBtn")}">${ic("import", 16)} ${t("btn.import")}</button>
         <button class="btn-ghost has-ic" click="actions.exportAll()" ${s.accounts.length ? "" : "disabled"} title="${t("s.exportAllBtn")}">${ic("exportAll", 16)} ${t("btn.export")}</button>
+        <button class="btn d" click="actions.deleteSelected()" ${acctSel.size ? "" : "disabled"} title="${t("btn.deleteSelectedTitle")}">${ic("trash", 14)} ${t("mb.delete")}${acctSel.size ? ` (${acctSel.size})` : ""}</button>
         ${s.zcode_running
           ? `<button class="btn-ghost has-ic" click="actions.askKill()" title="${t("btn.killZcode")}">${ic("power", 16)} ${t("btn.killZcode")}</button>`
           : s.zcode_path_ok
@@ -1409,7 +1470,20 @@ function render() {
                value="${esc(filter)}" placeholder="${t("m.filterPh")}" aria-label="${t("m.filterPh")}">`
           : ""}
       </section>
-      <div class="list account-list"><div class="group">${listHtml}</div></div>`;
+      <div class="list account-list">
+        ${filteredList.length
+          ? `<div class="list-head">
+               <label class="selall">
+                 <input type="checkbox" class="cbx" id="acct-all" ${acctSelAllOn(filteredList) ? "checked" : ""}>
+                 <span>${t("mb.selectAll")}</span>
+               </label>
+               <span class="selinfo">${acctSel.size ? t("mb.selected", { n: acctSel.size }) : ""}</span>
+               <span class="spacer"></span>
+               ${acctSel.size ? `<button class="btn g sm" click="actions.acctSelectNone()">${t("mb.selectNone")}</button>` : ""}
+             </div>`
+          : ""}
+        <div class="group">${listHtml}</div>
+      </div>`;
   }
 
   $app.innerHTML = `<div class="shell">${sidebar}<div class="content page-${tab}">${body}</div></div>`;
@@ -1425,12 +1499,21 @@ window.onRenameKey = (e, id) => {
 };
 installDelegation();
 setMboxRerender(() => { if (!uiLocked()) render(); });
-setRegSkip(() => mboxSkipCurrent());
+setRegSkip((email) => mboxSkipCurrent(email));
 
 document.addEventListener("change", (e) => {
   const el = e.target;
   if (!el) return;
+  if (el.id === "mb-conc-sel") { mboxSetConcurrency(el.value); return; }
   if (el.id === "mb-all") { mboxSelectAll(el.checked); return; }
+  if (el.id === "acct-all") { actions.acctSelectAll(el.checked); return; }
+  const acb = el.closest ? el.closest(".acct-check") : null;
+  if (acb) {
+    if (acb.checked) acctSel.add(acb.dataset.id);
+    else acctSel.delete(acb.dataset.id);
+    render();
+    return;
+  }
   const cb = el.closest ? el.closest(".mb-check") : null;
   if (!cb) return;
   mboxToggle(cb.dataset.email, cb.checked);
@@ -1497,25 +1580,28 @@ listen("captcha://interactive", () => {
 listen("oauth://done", (ev) => {
   const p = ev.payload || {};
   if (mboxRunning() && (p.ok !== false || !p.soft)) {
-    mboxOnOauthDone(mboxCurrent(), p.ok !== false, p.ok === false ? (p.error || "") : "");
+    mboxOnOauthDone(p.email || mboxCurrent(), p.ok !== false, p.ok === false ? (p.error || "") : "", p.flow);
+    if (p.ok !== false) {
+      refresh().then(() => { if (!uiLocked()) { render(); enrollAccounts(); } }).catch(() => {});
+    }
     return;
   }
   if (p.ok === false) {
     if (p.soft) {
-      regEvent({ kind: "log", level: "warn", code: "oauthSoft", a: p.error || t("m.unknownErr") });
+      regEvent({ kind: "log", level: "warn", code: "oauthSoft", a: p.error || t("m.unknownErr"), flow: p.flow, email: p.email });
       toast(t("m.oauthSoft", { err: p.error || t("m.unknownErr") }), "warn", t("m.oauthSoftDetail"));
       return;
     }
-    regEvent({ kind: "log", level: "error", code: "oauthFail", a: p.error || t("m.unknownErr") });
+    regEvent({ kind: "log", level: "error", code: "oauthFail", a: p.error || t("m.unknownErr"), flow: p.flow, email: p.email });
     toast(t("m.oauthFail", { err: p.error || t("m.unknownErr") }), "err");
     return;
   }
   if (p.duplicate) {
-    regEvent({ kind: "log", level: "warn", code: "oauthDup", a: p.name || "" });
+    regEvent({ kind: "log", level: "warn", code: "oauthDup", a: p.name || "", flow: p.flow, email: p.email });
     toast(t("m.oauthDup", { name: p.name }), "warn", t("m.oauthDupDetail"));
     return;
   }
-  regEvent({ kind: "log", level: "ok", code: "oauthDone", a: p.name || "" });
+  regEvent({ kind: "log", level: "ok", code: "oauthDone", a: p.name || "", flow: p.flow, email: p.email });
   toast(t("m.oauthOk", { name: p.name }), "ok", t("m.oauthOkDetail"));
   refresh().then(() => { if (!uiLocked()) { render(); enrollAccounts(); } }).catch(() => {});
 });
@@ -1596,6 +1682,7 @@ document.addEventListener("keydown", (e) => {
       Promise.all([invoke("get_state"), invoke("relay_status").catch(() => null)])
         .then(([s, rl]) => {
           state = s;
+          pruneAcctSel(state);
           if (rl) relay = rl;   // 中继的「当前路由 / 额度缓存」得跟着刷，不然界面停在打开那一刻
           if (s?.language) init(s.language);
           enrollAccounts();

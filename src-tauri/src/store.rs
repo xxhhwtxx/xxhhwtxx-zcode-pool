@@ -62,11 +62,36 @@ impl Paths {
     pub fn store_dir(&self) -> PathBuf { self.home.join(".zcode-pool") }
     pub fn accounts_dir(&self) -> PathBuf { self.store_dir().join("accounts") }
     pub fn settings_file(&self) -> PathBuf { self.store_dir().join("settings.json") }
-    pub fn live_file(&self) -> PathBuf { self.home.join(".zcode").join("v2").join("credentials.json") }
-    pub fn live_config(&self) -> PathBuf { self.home.join(".zcode").join("v2").join("config.json") }
-    pub fn live_telemetry(&self) -> PathBuf { self.home.join(".zcode").join("v2").join("telemetry-state.json") }
     pub fn live_setting(&self) -> PathBuf { self.home.join(".zcode").join("v2").join("setting.json") }
-    pub fn live_plan_cache(&self) -> PathBuf { self.home.join(".zcode").join("v2").join("coding-plan-cache.json") }
+
+    pub fn zcode_v2_dir(&self) -> PathBuf {
+        if !in_sandbox() {
+            if let Ok(dir) = std::env::var("ZCODE_DATA_BASE_DIR") {
+                let trimmed = dir.trim();
+                if !trimmed.is_empty() {
+                    return PathBuf::from(trimmed).join(".zcode").join("v2");
+                }
+            }
+        }
+        if let Ok(raw) = fs::read_to_string(self.live_setting()) {
+            if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+                if let Some(dir) = v
+                    .get("dataBaseDir")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    return PathBuf::from(dir).join(".zcode").join("v2");
+                }
+            }
+        }
+        self.home.join(".zcode").join("v2")
+    }
+
+    pub fn live_file(&self) -> PathBuf { self.zcode_v2_dir().join("credentials.json") }
+    pub fn live_config(&self) -> PathBuf { self.zcode_v2_dir().join("config.json") }
+    pub fn live_telemetry(&self) -> PathBuf { self.zcode_v2_dir().join("telemetry-state.json") }
+    pub fn live_plan_cache(&self) -> PathBuf { self.zcode_v2_dir().join("coding-plan-cache.json") }
 
     pub fn ensure_dirs(&self) -> Result<(), String> {
         fs::create_dir_all(self.accounts_dir()).map_err(|e| trf("err.store.mk_accounts_dir", &[("e", &e.to_string())]))?;
@@ -258,16 +283,19 @@ pub fn atomic_write(path: &Path, data: &str) -> Result<(), String> {
 }
 
 pub fn read_live(paths: &Paths) -> Result<Option<Value>, String> {
-    if !paths.live_file().exists() {
+    let live_path = paths.live_file();
+    if !live_path.exists() {
         return Ok(None);
     }
-    let raw = fs::read_to_string(paths.live_file())
-        .map_err(|e| trf("err.read", &[("path", &paths.live_file().display().to_string()), ("e", &e.to_string())]))?;
-    let v: Value = serde_json::from_str(&raw)
-        .map_err(|e| trf("err.bad_json", &[("path", &paths.live_file().display().to_string()), ("e", &e.to_string())]))?;
+    let raw = fs::read_to_string(&live_path)
+        .map_err(|e| trf("err.read", &[("path", &live_path.display().to_string()), ("e", &e.to_string())]))?;
+    let mut v: Value = serde_json::from_str(&raw)
+        .map_err(|e| trf("err.bad_json", &[("path", &live_path.display().to_string()), ("e", &e.to_string())]))?;
     if !v.is_object() {
         return Err(tr("err.store.not_object"));
     }
+    let legacy = paths.home.join(".zcode").join("v2").join("credentials.json");
+    zcrypto::unprotect_v2_in_place(&mut v, &[&live_path, &legacy]);
     Ok(Some(v))
 }
 
@@ -276,12 +304,48 @@ pub fn read_live_config(paths: &Paths) -> Option<Value> {
     serde_json::from_str(&raw).ok()
 }
 
+fn should_write_os_v2(paths: &Paths, live_path: &Path) -> bool {
+    let src_flag = paths.zcode_v2_dir().join("credential-source");
+    let pinned_os = fs::read_to_string(&src_flag)
+        .map(|s| s.trim().eq_ignore_ascii_case("os"))
+        .unwrap_or(false);
+    pinned_os && zcrypto::read_os_keyring_key(live_path).is_ok()
+}
+
 pub fn write_live(paths: &Paths, v: &Value) -> Result<(), String> {
-    if let Some(parent) = paths.live_file().parent() {
+    let live_path = paths.live_file();
+    if let Some(parent) = live_path.parent() {
         fs::create_dir_all(parent).map_err(|e| trf("err.mkdir", &[("e", &e.to_string())]))?;
     }
-    let body = serde_json::to_string_pretty(v).unwrap_or_default() + "\n";
-    atomic_write(&paths.live_file(), &body)
+    let out = if should_write_os_v2(paths, &live_path) {
+        let mut cloned = v.clone();
+        if let Some(map) = cloned.as_object_mut() {
+            let secret = zcrypto::default_secret(&paths.home);
+            for val in map.values_mut() {
+                if let Some(s) = val.as_str() {
+                    if s.starts_with(zcrypto::PREFIX_V2) {
+                        continue;
+                    }
+                    let plain = if s.starts_with(zcrypto::PREFIX) {
+                        match zcrypto::decrypt_with_secret(s, &secret) {
+                            Ok(p) => p,
+                            Err(_) => continue,
+                        }
+                    } else {
+                        s.to_string()
+                    };
+                    if let Ok(enc) = zcrypto::encrypt_v2_os_for_file(&plain, &live_path) {
+                        *val = Value::String(enc);
+                    }
+                }
+            }
+        }
+        cloned
+    } else {
+        v.clone()
+    };
+    let body = serde_json::to_string_pretty(&out).unwrap_or_default() + "\n";
+    atomic_write(&live_path, &body)
 }
 
 pub fn write_live_config(paths: &Paths, v: &Value) -> Result<(), String> {
@@ -403,25 +467,42 @@ pub fn open_url(url: &str) -> Result<(), String> {
         return Ok(());
     }
     #[cfg(windows)]
-    let cmd = {
-        let mut c = no_window("cmd");
-        c.args(["/c", "start", "", url]);
-        c
-    };
+    {
+        use windows_sys::Win32::UI::Shell::ShellExecuteW;
+        let op: Vec<u16> = "open\0".encode_utf16().collect();
+        let mut target: Vec<u16> = url.encode_utf16().collect();
+        target.push(0);
+        let rc = unsafe {
+            ShellExecuteW(
+                0,
+                op.as_ptr(),
+                target.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                1,
+            )
+        };
+        if rc <= 32 {
+            let mut c = no_window("cmd");
+            c.args(["/c", "start", "", url]);
+            c.spawn().map_err(|e| format!("打开链接失败（ShellExecute={rc}, cmd={e}）"))?;
+        }
+        return Ok(());
+    }
     #[cfg(target_os = "macos")]
-    let cmd = {
+    {
         let mut c = no_window("open");
         c.arg(url);
-        c
-    };
+        detached(c).spawn().map_err(|e| format!("打开链接失败：{e}"))?;
+        return Ok(());
+    }
     #[cfg(all(not(windows), not(target_os = "macos")))]
-    let cmd = {
+    {
         let mut c = no_window("xdg-open");
         c.arg(url);
-        c
-    };
-    let _ = detached(cmd).spawn();
-    Ok(())
+        detached(c).spawn().map_err(|e| format!("打开链接失败：{e}"))?;
+        Ok(())
+    }
 }
 
 pub fn set_relay_port(paths: &Paths, port: u16) -> Result<(), String> {
@@ -696,11 +777,7 @@ fn auto_preserve(paths: &Paths, accounts: &[Account], target_hash: &str) -> Resu
 
 fn cred_plain(creds: &Value, key: &str, home: &std::path::Path) -> Option<String> {
     let v = creds.get(key)?.as_str()?;
-    if zcrypto::is_encrypted(v) {
-        zcrypto::decrypt_with_secret(v, &zcrypto::default_secret(home)).ok()
-    } else {
-        Some(v.to_string())
-    }
+    zcrypto::decrypt_value_for_home(v, &zcrypto::default_secret(home), home).ok()
 }
 
 fn sync_live_back_to_source(paths: &Paths, accounts: &[Account]) -> Result<(), String> {
@@ -745,6 +822,29 @@ fn reset_live_plan_cache(paths: &Paths) {
     }
 }
 
+fn infer_connection_kind(cfg: Option<&Value>, provider: &str) -> Option<&'static str> {
+    let prov = cfg?.get("provider")?.as_object()?;
+    let coding_id = format!("builtin:{provider}-coding-plan");
+    let start_id = format!("builtin:{provider}-start-plan");
+    let coding_on = prov
+        .get(&coding_id)
+        .and_then(|v| v.get("enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let start_on = prov
+        .get(&start_id)
+        .and_then(|v| v.get("enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if start_on && !coding_on {
+        Some("start-plan")
+    } else if coding_on {
+        Some("individual-coding-plan")
+    } else {
+        None
+    }
+}
+
 fn align_family_domain(paths: &Paths, target: &Account) {
     let Some(provider) = cred_plain(&target.credentials, "oauth:active_provider", &paths.home)
         .filter(|p| p == "bigmodel" || p == "zai") else { return; };
@@ -753,10 +853,23 @@ fn align_family_domain(paths: &Paths, target: &Account) {
         eprintln!("setting.json 解析失败,跳过 family domain 对齐");
         return;
     };
+    let live_cfg = read_live_config(paths);
+    let conn_kind = infer_connection_kind(target.config.as_ref().or(live_cfg.as_ref()), &provider);
     let Some(obj) = v.as_object_mut() else { return; };
     let now_ms = chrono::Local::now().timestamp_millis();
-    obj.insert("providerFamilyDomain".into(), Value::String(provider));
+    obj.insert("providerFamilyDomain".into(), Value::String(provider.clone()));
     obj.insert("providerFamilyDomainUpdatedAt".into(), Value::from(now_ms));
+    if let Some(kind) = conn_kind {
+        let sel = obj
+            .entry("providerFamilyConnectionSelections".to_string())
+            .or_insert_with(|| json!({}));
+        if !sel.is_object() {
+            *sel = json!({});
+        }
+        if let Some(m) = sel.as_object_mut() {
+            m.insert(provider, json!({ "kind": kind }));
+        }
+    }
     let body = serde_json::to_string_pretty(&v).unwrap_or_default() + "\n";
     if let Err(e) = atomic_write(&paths.live_setting(), &body) {
         eprintln!("setting.json family domain 写回失败(忽略): {e}");
@@ -795,7 +908,7 @@ fn rematerialize_wiped_builtins(paths: &Paths, target: &Account) {
         (false, None) => String::new(),
     };
     let access_token = if provider == "zai" && !access_token.is_empty() {
-        crate::oauth::resolve_zai_business_token(&access_token).unwrap_or(access_token)
+        crate::oauth::resolve_zai_business_token(&access_token).unwrap_or_default()
     } else {
         access_token
     };
@@ -1008,6 +1121,23 @@ pub fn delete_account(paths: &Paths, id: &str) -> Result<(), String> {
         return Err(tr("err.store.no_account"));
     }
     fs::remove_file(&path).map_err(|e| trf("err.store.delete_fail", &[("e", &e.to_string())]))
+}
+
+pub fn delete_accounts(paths: &Paths, ids: &[String]) -> Result<usize, String> {
+    let mut removed = 0usize;
+    for raw in ids {
+        let id = raw.trim();
+        if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            continue;
+        }
+        let path = paths.accounts_dir().join(format!("{id}.json"));
+        if path.exists() {
+            fs::remove_file(&path)
+                .map_err(|e| trf("err.store.delete_fail", &[("e", &e.to_string())]))?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
 
 pub fn update_account_from_live(paths: &Paths, id: &str) -> Result<Account, String> {
@@ -1517,4 +1647,67 @@ pub fn get_state(paths: &Paths) -> Result<AppState, String> {
         auth_proxy_url: settings.auth_proxy_url.clone(),
         language: crate::i18n::current().as_str().to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zcode_v2_dir_respects_data_base_dir_in_setting() {
+        let dir = std::env::temp_dir().join(format!("zpool-basedir-{}", Uuid::new_v4()));
+        let custom_base = dir.join("custom-base");
+        let paths = Paths { home: dir.clone() };
+        assert_eq!(paths.zcode_v2_dir(), dir.join(".zcode").join("v2"));
+
+        fs::create_dir_all(paths.live_setting().parent().unwrap()).unwrap();
+        fs::write(
+            paths.live_setting(),
+            json!({ "dataBaseDir": custom_base.to_string_lossy() }).to_string(),
+        )
+        .unwrap();
+        assert_eq!(paths.zcode_v2_dir(), custom_base.join(".zcode").join("v2"));
+        assert_eq!(paths.live_file(), custom_base.join(".zcode").join("v2").join("credentials.json"));
+        assert_eq!(paths.live_setting(), dir.join(".zcode").join("v2").join("setting.json"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn align_family_domain_sets_start_plan_connection_selection() {
+        let dir = std::env::temp_dir().join(format!("zpool-align-{}", Uuid::new_v4()));
+        let paths = Paths { home: dir.clone() };
+        fs::create_dir_all(paths.live_setting().parent().unwrap()).unwrap();
+        fs::write(
+            paths.live_setting(),
+            json!({
+                "providerFamilyDomain": "zai",
+                "providerFamilyConnectionSelections": { "zai": { "kind": "individual-coding-plan" } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let acc = Account {
+            id: "a1".into(),
+            name: "n1".into(),
+            created_at: String::new(),
+            updated_at: String::new(),
+            hash: String::new(),
+            credentials: json!({ "oauth:active_provider": "zai" }),
+            config: Some(json!({
+                "provider": {
+                    "builtin:zai-coding-plan": { "enabled": false },
+                    "builtin:zai-start-plan": { "enabled": true }
+                }
+            })),
+            virtual_device_mid: None,
+            virtual_arms_uid: None,
+        };
+        align_family_domain(&paths, &acc);
+        let updated: Value = serde_json::from_str(&fs::read_to_string(paths.live_setting()).unwrap()).unwrap();
+        assert_eq!(
+            updated.pointer("/providerFamilyConnectionSelections/zai/kind").and_then(Value::as_str),
+            Some("start-plan")
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

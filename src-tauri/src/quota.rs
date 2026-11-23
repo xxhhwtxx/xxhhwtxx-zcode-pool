@@ -39,12 +39,7 @@ pub(crate) fn device_mid() -> Option<String> {
     static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     CACHE
         .get_or_init(|| {
-            let home = crate::store::pick_home(
-                std::env::var("ZCODE_POOL_HOME").ok().map(std::path::PathBuf::from),
-                std::env::var("USERPROFILE").ok().map(std::path::PathBuf::from),
-                std::env::var("HOME").ok().map(std::path::PathBuf::from),
-            );
-            let p = home.join(".zcode").join("v2").join("telemetry-state.json");
+            let p = crate::store::Paths::detect().live_telemetry();
             std::fs::read_to_string(p)
                 .ok()
                 .and_then(|s| serde_json::from_str::<Value>(&s).ok())
@@ -347,11 +342,7 @@ pub struct QuotaOverview {
 
 fn safe_decrypt(value: Option<&str>, secret: &str) -> Option<String> {
     let v = value?;
-    if zcrypto::is_encrypted(v) {
-        zcrypto::decrypt_with_secret(v, secret).ok()
-    } else {
-        Some(v.to_string())
-    }
+    zcrypto::decrypt_value_with_secret_or_v2(v, secret).ok()
 }
 
 fn looks_like_token(v: &str) -> bool {
@@ -1358,8 +1349,9 @@ fn normalize_balance(balance_data: &Value) -> QuotaOverview {
                 total: it_total,
                 used: it_used,
                 remaining: it_remaining,
-                percent_used: match (it_total, it_used) {
-                    (Some(t), Some(u)) if t > 0.0 => Some((u / t * 100.0).clamp(0.0, 100.0)),
+                percent_used: match (it_total, it_used, it_remaining) {
+                    (Some(t), Some(u), _) if t > 0.0 => Some((u / t * 100.0).clamp(0.0, 100.0)),
+                    (Some(t), None, Some(r)) if t > 0.0 => Some(((t - r).max(0.0) / t * 100.0).clamp(0.0, 100.0)),
                     _ => None,
                 },
                 server_percentage: None,
@@ -1395,11 +1387,19 @@ fn normalize_balance(balance_data: &Value) -> QuotaOverview {
     }
 
     if let Some(arr) = balance.get("plans").and_then(|p| p.as_array()) {
+        let now_secs = chrono::Utc::now().timestamp();
         for pl in arr {
             let pid = ["plan_id", "planId"]
                 .iter()
                 .find_map(|k| pl.get(k).and_then(Value::as_str))
                 .unwrap_or("");
+            let expired = ["ends_at", "expires_at"]
+                .iter()
+                .filter_map(|k| pl.get(k).and_then(|v| v.as_i64()))
+                .any(|ts| ts > 1_000_000_000 && ts < now_secs);
+            if expired {
+                continue;
+            }
             let Some(ents) = pl.get("entitlements").and_then(|e| e.as_array()) else {
                 continue;
             };
@@ -1418,14 +1418,17 @@ fn normalize_balance(balance_data: &Value) -> QuotaOverview {
                     .iter()
                     .find_map(|k| e.get(k).and_then(Value::as_str))
                     .unwrap_or("");
-                let already = !eid.is_empty()
-                    && (slots.iter().any(|s| {
-                        s.items
-                            .iter()
-                            .any(|it| it.source_key.as_deref() == Some(eid))
-                    }) || loose
-                        .iter()
-                        .any(|it| it.source_key.as_deref() == Some(eid)));
+                let name = ["show_name", "showName", "entitlement_id", "entitlementId"]
+                    .iter()
+                    .find_map(|k| e.get(k).and_then(Value::as_str))
+                    .unwrap_or("Unknown")
+                    .to_string();
+                let matches_item = |it: &QuotaItem| {
+                    (!eid.is_empty() && it.source_key.as_deref() == Some(eid))
+                        || (!name.is_empty() && it.name.eq_ignore_ascii_case(&name))
+                };
+                let already = slots.iter().any(|s| s.items.iter().any(&matches_item))
+                    || loose.iter().any(&matches_item);
                 if already {
                     continue;
                 }
@@ -1436,11 +1439,6 @@ fn normalize_balance(balance_data: &Value) -> QuotaOverview {
                 else {
                     continue;
                 };
-                let name = ["show_name", "showName", "entitlement_id", "entitlementId"]
-                    .iter()
-                    .find_map(|k| e.get(k).and_then(Value::as_str))
-                    .unwrap_or("Unknown")
-                    .to_string();
                 let period = e
                     .get("period")
                     .or_else(|| e.get("window"))

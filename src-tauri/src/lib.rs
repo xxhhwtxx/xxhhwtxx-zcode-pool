@@ -190,6 +190,15 @@ async fn delete_account(app: AppHandle, id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn delete_accounts(app: AppHandle, ids: Vec<String>) -> Result<Value, String> {
+    let _guard = store_guard();
+    let removed = store::delete_accounts(&Paths::detect(), &ids)?;
+    drop(_guard);
+    rebuild_tray(&app);
+    Ok(json!({ "removed": removed }))
+}
+
+#[tauri::command]
 async fn update_account_from_live(app: AppHandle, id: String) -> Result<Account, String> {
     let _guard = store_guard();
     let r = store::update_account_from_live(&Paths::detect(), &id);
@@ -400,10 +409,13 @@ fn close_captcha_window(app: &AppHandle) {
     }
 }
 
+#[derive(Clone)]
 struct PendingOAuth {
     provider: String,
     state: String,
     flow: String,
+    window_label: String,
+    email: Option<String>,
 }
 
 #[derive(Clone)]
@@ -414,13 +426,121 @@ struct PollCfg {
     interval_ms: u64,
 }
 
-static PENDING_OAUTH: Mutex<Option<PendingOAuth>> = Mutex::new(None);
+static PENDING_OAUTHS: Mutex<Option<std::collections::HashMap<String, PendingOAuth>>> = Mutex::new(None);
+static LIVE_LOGIN_PROFILES: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
 
-fn pending_oauth_guard() -> std::sync::MutexGuard<'static, Option<PendingOAuth>> {
-    match PENDING_OAUTH.lock() {
+fn with_pending_oauths<R>(f: impl FnOnce(&mut std::collections::HashMap<String, PendingOAuth>) -> R) -> R {
+    let mut guard = match PENDING_OAUTHS.lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
+    };
+    let map = guard.get_or_insert_with(std::collections::HashMap::new);
+    f(map)
+}
+
+fn with_live_login_profiles<R>(f: impl FnOnce(&mut std::collections::HashSet<String>) -> R) -> R {
+    let mut guard = match LIVE_LOGIN_PROFILES.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let set = guard.get_or_insert_with(std::collections::HashSet::new);
+    f(set)
+}
+
+fn find_login_window(app: &AppHandle, flow: Option<&str>, email: Option<&str>) -> Option<tauri::WebviewWindow> {
+    if let Some(f) = flow.map(str::trim).filter(|s| !s.is_empty()) {
+        let lbl = with_pending_oauths(|m| m.get(f).map(|p| p.window_label.clone()))
+            .unwrap_or_else(|| format!("login-{f}"));
+        if let Some(w) = app.get_webview_window(&lbl) {
+            return Some(w);
+        }
     }
+    if let Some(em) = email.map(str::trim).filter(|s| !s.is_empty()) {
+        let lbl = with_pending_oauths(|m| {
+            m.values()
+                .find(|p| p.email.as_deref().map_or(false, |e| e.eq_ignore_ascii_case(em)))
+                .map(|p| p.window_label.clone())
+        });
+        if let Some(l) = lbl {
+            if let Some(w) = app.get_webview_window(&l) {
+                return Some(w);
+            }
+        }
+    }
+    if let Some(w) = app.get_webview_window("login") {
+        return Some(w);
+    }
+    let any_lbl = with_pending_oauths(|m| m.values().next().map(|p| p.window_label.clone()));
+    any_lbl.and_then(|l| app.get_webview_window(&l))
+}
+
+fn batch_grid(concurrency: usize) -> (usize, usize) {
+    let cols = match concurrency {
+        0 | 1 => 1,
+        2 | 3 => concurrency,
+        4 => 2,
+        5 | 6 => 3,
+        7 | 8 => 4,
+        9 | 10 => 5,
+        11 | 12 => 6,
+        _ => 7,
+    };
+    let rows = (concurrency.max(1) + cols - 1) / cols;
+    (cols, rows)
+}
+
+fn position_batch_window(
+    app: &AppHandle,
+    win: &tauri::WebviewWindow,
+    slot: usize,
+    concurrency: usize,
+    w: f64,
+    h: f64,
+) {
+    if concurrency <= 1 {
+        return;
+    }
+    let mon = app
+        .get_webview_window("main")
+        .and_then(|m| m.current_monitor().ok().flatten().or_else(|| m.primary_monitor().ok().flatten()));
+    let (sx, sy, sw, sh) = match mon {
+        Some(m) => {
+            let scale = m.scale_factor().max(1.0);
+            let pos = m.position();
+            let sz = m.size();
+            (
+                pos.x as f64 / scale,
+                pos.y as f64 / scale,
+                sz.width as f64 / scale,
+                (sz.height as f64 / scale - 48.0).max(h),
+            )
+        }
+        None => (0.0, 0.0, 1920.0, 1020.0),
+    };
+    let (cols, rows) = batch_grid(concurrency);
+    let col = slot % cols;
+    let row = (slot / cols) % rows;
+    let pad_x = 16.0;
+    let pad_y = 20.0;
+    let avail_w = (sw - pad_x * 2.0).max(w);
+    let avail_h = (sh - pad_y * 2.0).max(h);
+    let step_x = if cols > 1 {
+        ((avail_w - w) / ((cols - 1) as f64)).clamp(120.0, w + 16.0)
+    } else {
+        0.0
+    };
+    let step_y = if rows > 1 {
+        ((avail_h - h) / ((rows - 1) as f64)).clamp(80.0, h + 16.0)
+    } else {
+        0.0
+    };
+    let total_w = w + step_x * ((cols - 1) as f64);
+    let total_h = h + step_y * ((rows - 1) as f64);
+    let start_x = sx + ((sw - total_w) / 2.0).max(pad_x);
+    let start_y = sy + ((sh - total_h) / 2.0).max(pad_y);
+    let x = (start_x + (col as f64) * step_x).clamp(sx, (sx + sw - w).max(sx));
+    let y = (start_y + (row as f64) * step_y).clamp(sy, (sy + sh - h).max(sy));
+    let _ = win.set_position(tauri::LogicalPosition::new(x, y));
 }
 
 #[tauri::command]
@@ -434,12 +554,16 @@ async fn oauth_begin(
     provider: String,
     mode: Option<String>,
     batch: Option<bool>,
+    email: Option<String>,
+    slot: Option<usize>,
+    concurrency: Option<usize>,
 ) -> Result<serde_json::Value, String> {
     if !oauth::OAUTH_PROVIDERS.iter().any(|p| p.id == provider) {
         return Err(i18n::trf("err.oauth.unknown_provider", &[("provider", &provider)]));
     }
     let assist_mode = driver::normalize_mode(mode.as_deref());
     let auto = batch.unwrap_or(false);
+    let email_clean = email.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
     let proxy_url: Option<tauri::Url> = match load_settings(&Paths::detect()).auth_proxy() {
         Some(p) => {
             let norm = oauth::parse_proxy_url(p)?;
@@ -447,12 +571,41 @@ async fn oauth_begin(
         }
         None => None,
     };
-    *pending_oauth_guard() = None;
-    if let Some(w) = app.get_webview_window("login") {
-        let _ = w.close();
+    if !auto {
+        let old_labels: Vec<String> = with_pending_oauths(|m| {
+            let keys: Vec<String> = m
+                .iter()
+                .filter(|(_, p)| p.window_label == "login")
+                .map(|(k, _)| k.clone())
+                .collect();
+            keys.into_iter().filter_map(|k| m.remove(&k).map(|p| p.window_label)).collect()
+        });
+        for lbl in old_labels {
+            if let Some(w) = app.get_webview_window(&lbl) {
+                let _ = w.close();
+            }
+        }
+        if let Some(w) = app.get_webview_window("login") {
+            let _ = w.close();
+        }
+    } else if let Some(ref em) = email_clean {
+        let old_labels: Vec<String> = with_pending_oauths(|m| {
+            let keys: Vec<String> = m
+                .iter()
+                .filter(|(_, p)| p.email.as_deref().map_or(false, |e| e.eq_ignore_ascii_case(em)))
+                .map(|(k, _)| k.clone())
+                .collect();
+            keys.into_iter().filter_map(|k| m.remove(&k).map(|p| p.window_label)).collect()
+        });
+        for lbl in old_labels {
+            if let Some(w) = app.get_webview_window(&lbl) {
+                let _ = w.close();
+            }
+        }
     }
     let flow = uuid::Uuid::new_v4().to_string();
-    flowlog::log(&flow, "begin", &format!("provider={provider} auto={auto} proxy={} client_ver={}", if proxy_url.is_some() { "on" } else { "off" }, quota::zcode_app_version()));
+    let window_label = if auto { format!("login-{flow}") } else { "login".to_string() };
+    flowlog::log(&flow, "begin", &format!("provider={provider} auto={auto} email={} proxy={} client_ver={}", email_clean.as_deref().unwrap_or("-"), if proxy_url.is_some() { "on" } else { "off" }, quota::zcode_app_version()));
     let mid = uuid::Uuid::new_v4().to_string();
     let (p_init, m_init) = (provider.clone(), mid.clone());
     let init = match tauri::async_runtime::spawn_blocking(move || oauth::init_flow(&p_init, &m_init))
@@ -490,10 +643,17 @@ async fn oauth_begin(
         expires_at_ms: init.expires_at_ms,
         interval_ms: init.poll_interval_ms,
     };
-    *pending_oauth_guard() = Some(PendingOAuth {
-        provider: provider.clone(),
-        state: state.clone(),
-        flow: flow.clone(),
+    with_pending_oauths(|m| {
+        m.insert(
+            flow.clone(),
+            PendingOAuth {
+                provider: provider.clone(),
+                state: state.clone(),
+                flow: flow.clone(),
+                window_label: window_label.clone(),
+                email: email_clean.clone(),
+            },
+        );
     });
 
     let login_root = app
@@ -501,6 +661,9 @@ async fn oauth_begin(
         .app_local_data_dir()
         .map_err(|e| i18n::trf("err.oauth.appdata", &[("e", &e.to_string())]))?
         .join("login-webview");
+    with_live_login_profiles(|s| {
+        s.insert(flow.clone());
+    });
     sweep_login_profiles(&login_root);
     let profile_dir = login_root.join(&flow);
 
@@ -514,19 +677,34 @@ async fn oauth_begin(
         "auto": auto,
     }));
     let flow_driver = flow.clone();
+    let email_driver = email_clean.clone();
+    let win_title = match email_clean.as_deref() {
+        Some(em) => format!("{} · {em}", i18n::tr("title.login")),
+        None => i18n::tr("title.login"),
+    };
+    let conc = concurrency.unwrap_or(1);
+    let (win_w, win_h) = if conc > 8 {
+        (400.0, 560.0)
+    } else if conc > 1 {
+        (440.0, 640.0)
+    } else {
+        (480.0, 680.0)
+    };
+    const LOGIN_BROWSER_ARGS: &str = "--disk-cache-size=16777216 --media-cache-size=1048576 --disable-background-timer-throttling --disable-renderer-backgrounding --disable-backgrounding-occluded-windows";
     let mut builder = tauri::WebviewWindowBuilder::new(
         &app,
-        "login",
+        &window_label,
         tauri::WebviewUrl::External(url.parse::<tauri::Url>().map_err(|e| i18n::trf("err.oauth.bad_authorize_url", &[("e", &e.to_string())]))?),
     )
-    .title(i18n::tr("title.login"))
+    .title(win_title)
     .theme(Some(tauri::Theme::Dark))
-    .inner_size(480.0, 680.0)
-    .min_inner_size(420.0, 560.0)
+    .inner_size(win_w, win_h)
+    .min_inner_size(380.0, 520.0)
     .resizable(true)
     .user_agent(oauth::LOGIN_WINDOW_UA)
     .initialization_script(&driver_script)
-    .data_directory(profile_dir);
+    .additional_browser_args(LOGIN_BROWSER_ARGS)
+    .data_directory(profile_dir.clone());
     if let Some(u) = proxy_url {
         builder = builder.proxy_url(u);
     }
@@ -534,8 +712,14 @@ async fn oauth_begin(
     .on_navigation(move |url| {
         if url.scheme() == driver::SENTINEL_SCHEME {
             match driver::parse_message(&url.to_string()) {
-                Some(msg) => {
+                Some(mut msg) => {
                     flowlog::log(&flow_driver, "drv", &driver::summarize(&msg));
+                    if let Some(obj) = msg.as_object_mut() {
+                        obj.insert("flow".into(), Value::String(flow_driver.clone()));
+                        if let Some(ref em) = email_driver {
+                            obj.insert("email".into(), Value::String(em.clone()));
+                        }
+                    }
                     let _ = app2.emit("reg://event", msg);
                 }
                 None => flowlog::log(&flow_driver, "driver-bad-msg", ""),
@@ -559,38 +743,77 @@ async fn oauth_begin(
     })
     .build()
     .map_err(|e| {
-        let mut pending = pending_oauth_guard();
-        if pending.as_ref().map(|p| p.flow == flow).unwrap_or(false) {
-            *pending = None;
-        }
+        with_pending_oauths(|m| {
+            m.remove(&flow);
+        });
+        with_live_login_profiles(|s| {
+            s.remove(&flow);
+        });
+        schedule_profile_cleanup(profile_dir.clone());
         let m = i18n::trf("err.oauth.window", &[("e", &e.to_string())]);
         flowlog::log(&flow, "window-fail", &m);
         m
     })?;
-    if let Some(w) = app.get_webview_window("login") {
+    if let Some(w) = app.get_webview_window(&window_label) {
+        if conc > 1 {
+            position_batch_window(&app, &w, slot.unwrap_or(0), conc, win_w, win_h);
+        }
         let app_close = app.clone();
+        let flow_destroy = flow.clone();
+        let profile_dir_destroy = profile_dir.clone();
         w.on_window_event(move |e| {
-            if let tauri::WindowEvent::CloseRequested { .. } = e {
-                let mut pending = pending_oauth_guard();
-                if pending.as_ref().map(|p| p.flow == flow_close).unwrap_or(false) {
-                    flowlog::log(&flow_close, "cancelled", "");
-                    *pending = None;
-                    let _ = app_close.emit("reg://event", driver::closed_event());
+            match e {
+                tauri::WindowEvent::CloseRequested { .. } => {
+                    if let Some(removed) = with_pending_oauths(|m| m.remove(&flow_close)) {
+                        flowlog::log(&flow_close, "cancelled", "");
+                        let mut ev = driver::closed_event();
+                        if let Some(obj) = ev.as_object_mut() {
+                            obj.insert("flow".into(), Value::String(flow_close.clone()));
+                            if let Some(em) = removed.email {
+                                obj.insert("email".into(), Value::String(em));
+                            }
+                        }
+                        let _ = app_close.emit("reg://event", ev);
+                    }
                 }
+                tauri::WindowEvent::Destroyed => {
+                    with_live_login_profiles(|s| {
+                        s.remove(&flow_destroy);
+                    });
+                    schedule_profile_cleanup(profile_dir_destroy.clone());
+                }
+                _ => {}
             }
         });
+    } else {
+        with_live_login_profiles(|s| {
+            s.remove(&flow);
+        });
+        schedule_profile_cleanup(profile_dir);
     }
     spawn_poll_loop(app.clone(), provider.clone(), flow.clone(), mid, poll_cfg);
-    Ok(json!({ "opened": true, "provider": provider, "mode": assist_mode }))
+    Ok(json!({
+        "opened": true,
+        "provider": provider,
+        "mode": assist_mode,
+        "flow": flow,
+        "window": window_label,
+        "email": email_clean,
+    }))
 }
 
 #[tauri::command]
-async fn reg_input(app: AppHandle, ask: String, value: Value) -> Result<(), String> {
+async fn reg_input(
+    app: AppHandle,
+    ask: String,
+    value: Value,
+    flow: Option<String>,
+    email: Option<String>,
+) -> Result<(), String> {
     if ask != "signup" && ask != "link" {
         return Err(i18n::trf("err.reg.bad_ask", &[("ask", &ask)]));
     }
-    let win = app
-        .get_webview_window("login")
+    let win = find_login_window(&app, flow.as_deref(), email.as_deref())
         .ok_or_else(|| i18n::tr("err.reg.no_window"))?;
     let js = format!(
         "window.__zpool && window.__zpool.fromHost({});",
@@ -601,9 +824,13 @@ async fn reg_input(app: AppHandle, ask: String, value: Value) -> Result<(), Stri
 }
 
 #[tauri::command]
-async fn reg_action(app: AppHandle, action: String) -> Result<(), String> {
-    let win = app
-        .get_webview_window("login")
+async fn reg_action(
+    app: AppHandle,
+    action: String,
+    flow: Option<String>,
+    email: Option<String>,
+) -> Result<(), String> {
+    let win = find_login_window(&app, flow.as_deref(), email.as_deref())
         .ok_or_else(|| i18n::tr("err.reg.no_window"))?;
     match action.as_str() {
         "reveal" => {
@@ -631,14 +858,19 @@ async fn reg_fetch_link(
     since: Option<i64>,
 ) -> Result<Value, String> {
     let root = Paths::detect().store_dir();
-    let mut accounts = pool::load(&root);
-    let acc = pool::find(&accounts, &email)
-        .ok_or_else(|| i18n::trf("err.pool.not_found", &[("email", email.trim())]))?
-        .clone();
-    let cur_flow = pending_oauth_guard()
-        .as_ref()
-        .map(|p| p.flow.clone())
-        .unwrap_or_default();
+    let acc = {
+        let accounts = pool::load(&root);
+        pool::find(&accounts, &email)
+            .ok_or_else(|| i18n::trf("err.pool.not_found", &[("email", email.trim())]))?
+            .clone()
+    };
+    let cur_flow = with_pending_oauths(|m| {
+        m.values()
+            .find(|p| p.email.as_deref().map_or(false, |e| e.eq_ignore_ascii_case(email.trim())))
+            .or_else(|| m.values().next())
+            .map(|p| p.flow.clone())
+            .unwrap_or_default()
+    });
     let (found, new_rt) = match graph::fetch_links(
         &acc.client_id,
         &acc.refresh_token,
@@ -652,6 +884,7 @@ async fn reg_fetch_link(
                 flowlog::log(&cur_flow, "link-fetch-fail", &short);
             }
             if graph::is_credential_error(&e) {
+                let _guard = store_guard();
                 let _ = pool::set_status(&root, &email, pool::STATUS_INVALID, Some(i18n::tr("err.graph.reauth")));
             }
             return Err(e);
@@ -676,6 +909,8 @@ async fn reg_fetch_link(
         );
     }
     if let Some(rt) = new_rt {
+        let _guard = store_guard();
+        let mut accounts = pool::load(&root);
         if let Some(a) = pool::find_mut(&mut accounts, &email) {
             a.refresh_token = rt;
             let _ = pool::save(&root, &accounts);
@@ -791,9 +1026,41 @@ async fn pool_mark_verified(
 }
 
 #[tauri::command]
-async fn reg_close_window(app: AppHandle) -> Result<(), String> {
-    if let Some(w) = app.get_webview_window("login") {
-        let _ = w.close();
+async fn reg_close_window(app: AppHandle, flow: Option<String>, email: Option<String>) -> Result<(), String> {
+    let f_trim = flow.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let e_trim = email.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    if f_trim.is_some() || e_trim.is_some() {
+        let labels: Vec<String> = with_pending_oauths(|m| {
+            let keys: Vec<String> = m
+                .iter()
+                .filter(|(_, p)| {
+                    f_trim.map_or(false, |f| p.flow == f)
+                        || e_trim.map_or(false, |em| p.email.as_deref().map_or(false, |e| e.eq_ignore_ascii_case(em)))
+                })
+                .map(|(k, _)| k.clone())
+                .collect();
+            keys.into_iter().filter_map(|k| m.remove(&k).map(|p| p.window_label)).collect()
+        });
+        for lbl in labels {
+            if let Some(w) = app.get_webview_window(&lbl) {
+                let _ = w.close();
+            }
+        }
+        if let Some(f) = f_trim {
+            if let Some(w) = app.get_webview_window(&format!("login-{f}")) {
+                let _ = w.close();
+            }
+        }
+    } else {
+        let labels: Vec<String> = with_pending_oauths(|m| m.drain().map(|(_, p)| p.window_label).collect());
+        for lbl in labels {
+            if let Some(w) = app.get_webview_window(&lbl) {
+                let _ = w.close();
+            }
+        }
+        if let Some(w) = app.get_webview_window("login") {
+            let _ = w.close();
+        }
     }
     Ok(())
 }
@@ -894,13 +1161,17 @@ async fn outlook_reauth_poll(
 }
 
 #[tauri::command]
-async fn reg_set_mode(app: AppHandle, mode: String) -> Result<String, String> {
+async fn reg_set_mode(
+    app: AppHandle,
+    mode: String,
+    flow: Option<String>,
+    email: Option<String>,
+) -> Result<String, String> {
     let m = mode.trim().to_ascii_lowercase();
     if !driver::is_valid_mode(&m) {
         return Err(i18n::trf("err.reg.bad_mode", &[("m", &mode)]));
     }
-    let win = app
-        .get_webview_window("login")
+    let win = find_login_window(&app, flow.as_deref(), email.as_deref())
         .ok_or_else(|| i18n::tr("err.reg.no_window"))?;
     let js = format!(
         "window.__zpool && window.__zpool.fromHost({});",
@@ -911,14 +1182,36 @@ async fn reg_set_mode(app: AppHandle, mode: String) -> Result<String, String> {
     Ok(m)
 }
 
+fn schedule_profile_cleanup(dir: std::path::PathBuf) {
+    if !dir.exists() {
+        return;
+    }
+    std::thread::spawn(move || {
+        // WebView2 subprocesses may release file handles slightly after HWND destruction.
+        for delay_ms in [250u64, 600, 1200, 2500, 5000] {
+            if std::fs::remove_dir_all(&dir).is_ok() || !dir.exists() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
 fn sweep_login_profiles(root: &std::path::Path) {
     let Ok(entries) = std::fs::read_dir(root) else { return };
-    let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(7 * 24 * 3600);
+    let live: std::collections::HashSet<String> = with_live_login_profiles(|s| s.clone());
     for e in entries.flatten() {
         let Ok(meta) = e.metadata() else { continue };
-        if meta.is_dir() && meta.modified().map(|m| m < cutoff).unwrap_or(false) {
-            let _ = std::fs::remove_dir_all(e.path());
+        if !meta.is_dir() {
+            continue;
         }
+        if let Some(name) = e.file_name().to_str() {
+            if live.contains(name) {
+                continue;
+            }
+        }
+        let _ = std::fs::remove_dir_all(e.path());
     }
 }
 
@@ -953,7 +1246,7 @@ async fn finish_oauth(app: &AppHandle, provider: String, state: String, flow: St
         let callback_url = callback_url.to_string();
         tauri::async_runtime::spawn_blocking(move || -> Result<serde_json::Value, String> {
             {
-                let pending = pending_oauth_guard();
+                let pending = with_pending_oauths(|m| m.get(&flow).cloned());
                 match pending.as_ref() {
                     Some(p) if p.provider == provider && p.state == state && p.flow == flow => {}
                     Some(_) | None => {
@@ -1006,15 +1299,24 @@ async fn finish_oauth(app: &AppHandle, provider: String, state: String, flow: St
     };
     if let Err(e) = &result {
         if deeplink_err_soft(e) {
-            let ours = pending_oauth_guard().as_ref().map(|p| p.flow == flow).unwrap_or(false);
-            if ours {
+            let pending = with_pending_oauths(|m| m.get(&flow).cloned());
+            if let Some(p) = pending {
                 flowlog::log(&flow, "soft-fail", e);
-                let _ = app.emit("oauth://done", &json!({ "ok": false, "soft": true, "error": e }));
+                let _ = app.emit(
+                    "oauth://done",
+                    &json!({
+                        "ok": false,
+                        "soft": true,
+                        "error": e,
+                        "flow": flow,
+                        "email": p.email,
+                    }),
+                );
             }
             return;
         }
     }
-    finalize_oauth_result(app, result);
+    finalize_oauth_result(app, &flow, result);
 }
 
 fn deeplink_err_soft(e: &str) -> bool {
@@ -1029,12 +1331,7 @@ fn persist_oauth_account(
     mid: &str,
     poll_ready: bool,
 ) -> Result<serde_json::Value, String> {
-    let flow_still_ours = || {
-        pending_oauth_guard()
-            .as_ref()
-            .map(|p| p.flow == flow)
-            .unwrap_or(false)
-    };
+    let flow_still_ours = || with_pending_oauths(|m| m.contains_key(flow));
     if !flow_still_ours() {
         return Err("__superseded__".into());
     }
@@ -1048,16 +1345,17 @@ fn persist_oauth_account(
     let t_all = std::time::Instant::now();
     let t_biz = std::time::Instant::now();
     let raw_access = oauth::extract_access_token(provider, raw).unwrap_or_default();
-    let access_token = if provider == "zai" && !raw_access.is_empty() {
+    let (cred_access, biz_access) = if provider == "zai" && !raw_access.is_empty() {
         match oauth::resolve_zai_business_token_diag(&raw_access) {
-            (Some(t), _) => t,
+            (Some(t), _) => (t.clone(), t),
             (None, why) => {
-                flowlog::log(flow, "zai-business-fail", &why);
-                return Err(i18n::tr("err.oauth.zai_business"));
+                // Keep the z.ai account usable via zcodejwttoken when api.z.ai rejects business token exchange.
+                flowlog::log(flow, "zai-business-skip", &why);
+                (raw_access.clone(), String::new())
             }
         }
     } else {
-        raw_access
+        (raw_access.clone(), raw_access.clone())
     };
     let ms_biz = t_biz.elapsed().as_millis();
     let t_user = std::time::Instant::now();
@@ -1067,8 +1365,8 @@ fn persist_oauth_account(
         oauth::extract_user_profile(provider, raw)
     }
     .or_else(|| {
-        (!access_token.is_empty())
-            .then(|| oauth::fetch_userinfo(provider, &access_token))
+        (!raw_access.is_empty())
+            .then(|| oauth::fetch_userinfo(provider, &raw_access))
             .flatten()
     });
     let refresh_token = oauth::extract_refresh_token(provider, raw);
@@ -1078,10 +1376,10 @@ fn persist_oauth_account(
         provider,
         &jwt,
         userinfo.as_ref(),
-        (!access_token.is_empty()).then_some(access_token.as_str()),
+        (!cred_access.is_empty()).then_some(cred_access.as_str()),
         refresh_token.as_deref(),
     );
-    let config = oauth::assemble_config(provider, &jwt, &access_token);
+    let config = oauth::assemble_config(provider, &jwt, &biz_access);
     flowlog::log(
         flow,
         "persist-t",
@@ -1107,12 +1405,19 @@ fn persist_oauth_account(
         if dup.virtual_device_mid.as_deref().map_or(true, |m| m.trim().is_empty()) {
             dup.virtual_device_mid = Some(mid.to_string());
         }
-        if !flow_still_ours() {
+        let Some(pending) = with_pending_oauths(|m| m.remove(flow)) else {
             return Err("__superseded__".into());
-        }
+        };
         save_account(paths, &dup)?;
-        *pending_oauth_guard() = None;
-        return Ok(json!({ "id": dup.id, "name": dup.name, "provider": provider, "duplicate": true }));
+        return Ok(json!({
+            "id": dup.id,
+            "name": dup.name,
+            "provider": provider,
+            "duplicate": true,
+            "flow": flow,
+            "email": pending.email,
+            "window_label": pending.window_label,
+        }));
     }
     let base = credentials
         .get(format!("oauth:{provider}:user_info"))
@@ -1136,33 +1441,54 @@ fn persist_oauth_account(
         virtual_device_mid: Some(mid.to_string()),
         virtual_arms_uid: Some(store::new_arms_uid()),
     };
-    if !flow_still_ours() {
+    let Some(pending) = with_pending_oauths(|m| m.remove(flow)) else {
         return Err("__superseded__".into());
-    }
+    };
     save_account(paths, &acc)?;
-    *pending_oauth_guard() = None;
-    Ok(json!({ "id": acc.id, "name": acc.name, "provider": provider }))
+    Ok(json!({
+        "id": acc.id,
+        "name": acc.name,
+        "provider": provider,
+        "flow": flow,
+        "email": pending.email,
+        "window_label": pending.window_label,
+    }))
 }
 
-fn finalize_oauth_result(app: &AppHandle, result: Result<serde_json::Value, String>) {
+fn finalize_oauth_result(app: &AppHandle, flow: &str, result: Result<serde_json::Value, String>) {
     if let Err(e) = &result {
         if e == "__superseded__" || e == "__attribution__" {
             return;
         }
     }
-    if let Some(w) = app.get_webview_window("login") {
+    let removed = with_pending_oauths(|m| m.remove(flow));
+    if result.is_err() && removed.is_none() {
+        return;
+    }
+    let win_label = result
+        .as_ref()
+        .ok()
+        .and_then(|v| v.get("window_label").and_then(|s| s.as_str()).map(String::from))
+        .or_else(|| removed.as_ref().map(|p| p.window_label.clone()))
+        .unwrap_or_else(|| format!("login-{flow}"));
+    if let Some(w) = app.get_webview_window(&win_label) {
         let _ = w.close();
     }
+    let email = result
+        .as_ref()
+        .ok()
+        .and_then(|v| v.get("email").and_then(|s| s.as_str()).map(String::from))
+        .or_else(|| removed.and_then(|p| p.email));
     let payload = match result {
         Ok(v) => v,
-        Err(e) => json!({ "ok": false, "error": e }),
+        Err(e) => json!({ "ok": false, "error": e, "flow": flow, "email": email }),
     };
     let _ = app.emit("oauth://done", &payload);
 }
 
 fn spawn_poll_loop(app: AppHandle, provider: String, flow: String, mid: String, cfg: PollCfg) {
     std::thread::spawn(move || {
-        let ours = || pending_oauth_guard().as_ref().map(|p| p.flow == flow).unwrap_or(false);
+        let ours = || with_pending_oauths(|m| m.contains_key(&flow));
         let deadline = {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1192,7 +1518,7 @@ fn spawn_poll_loop(app: AppHandle, provider: String, flow: String, mid: String, 
                         }
                         Err(_) => {}
                     }
-                    finalize_oauth_result(&app, result);
+                    finalize_oauth_result(&app, &flow, result);
                     return;
                 }
                 Err(e) => {
@@ -1201,8 +1527,7 @@ fn spawn_poll_loop(app: AppHandle, provider: String, flow: String, mid: String, 
                         return;
                     }
                     flowlog::log(&flow, "poll-fail", &e);
-                    *pending_oauth_guard() = None;
-                    finalize_oauth_result(&app, Err(e));
+                    finalize_oauth_result(&app, &flow, Err(e));
                     return;
                 }
             }
@@ -1215,8 +1540,7 @@ fn spawn_poll_loop(app: AppHandle, provider: String, flow: String, mid: String, 
                     return;
                 }
                 flowlog::log(&flow, "poll-timeout", "");
-                *pending_oauth_guard() = None;
-                finalize_oauth_result(&app, Err(i18n::tr("err.oauth.expired")));
+                finalize_oauth_result(&app, &flow, Err(i18n::tr("err.oauth.expired")));
                 return;
             }
             let sleep = (deadline - now).min(cfg.interval_ms as u128) as u64;
@@ -1325,6 +1649,18 @@ async fn set_language(app: AppHandle, lang: String) -> Result<(), String> {
     for (label, key) in [("captcha", "title.captcha"), ("login", "title.login")] {
         if let Some(w) = app.get_webview_window(label) {
             let _ = w.set_title(&i18n::tr(key));
+        }
+    }
+    let batch_windows: Vec<(String, Option<String>)> = with_pending_oauths(|m| {
+        m.values().map(|p| (p.window_label.clone(), p.email.clone())).collect()
+    });
+    for (lbl, em) in batch_windows {
+        if let Some(w) = app.get_webview_window(&lbl) {
+            let title = match em.as_deref() {
+                Some(e) if !e.is_empty() => format!("{} · {e}", i18n::tr("title.login")),
+                _ => i18n::tr("title.login"),
+            };
+            let _ = w.set_title(&title);
         }
     }
     let _ = app.emit("state-changed", ());
@@ -1559,6 +1895,18 @@ async fn relay_external(on: bool) -> Result<Value, String> {
     relay().set_external_and_run(&Paths::detect(), on)
 }
 
+fn close_login_windows(app: &AppHandle) {
+    let labels: Vec<String> = with_pending_oauths(|m| m.drain().map(|(_, p)| p.window_label).collect());
+    for lbl in labels {
+        if let Some(w) = app.get_webview_window(&lbl) {
+            let _ = w.close();
+        }
+    }
+    if let Some(w) = app.get_webview_window("login") {
+        let _ = w.close();
+    }
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -1575,6 +1923,7 @@ pub fn run() {
             capture_current,
             rename_account,
             delete_account,
+            delete_accounts,
             update_account_from_live,
             switch_to,
             get_live_quota,
@@ -1631,6 +1980,8 @@ pub fn run() {
                     if store::load_settings(&paths).close_to_tray() {
                         api.prevent_close();
                         let _ = window.hide();
+                    } else {
+                        close_login_windows(window.app_handle());
                     }
                 }
                 if window.label() == "captcha" {
@@ -1642,6 +1993,10 @@ pub fn run() {
             i18n::init_from_settings(&store::load_settings(&Paths::detect()));
             if let Ok(data_dir) = app.path().app_local_data_dir() {
                 flowlog::init(&data_dir);
+                let login_root = data_dir.join("login-webview");
+                std::thread::spawn(move || {
+                    sweep_login_profiles(&login_root);
+                });
             }
 
             let paths = Paths::detect();
@@ -1671,7 +2026,10 @@ pub fn run() {
                     let id = event.id().as_ref().to_string();
                     match id.as_str() {
                         "show" => show_main(app),
-                        "quit" => app.exit(0),
+                        "quit" => {
+                            close_login_windows(app);
+                            app.exit(0);
+                        }
                         other => run_tray_action(app.clone(), other.to_string()),
                     }
                 })
@@ -1686,4 +2044,44 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{batch_grid, sweep_login_profiles, with_live_login_profiles};
+
+    #[test]
+    fn batch_grid_handles_up_to_14_windows() {
+        assert_eq!(batch_grid(1), (1, 1));
+        assert_eq!(batch_grid(4), (2, 2));
+        assert_eq!(batch_grid(6), (3, 2));
+        assert_eq!(batch_grid(8), (4, 2));
+        assert_eq!(batch_grid(10), (5, 2));
+        assert_eq!(batch_grid(12), (6, 2));
+        assert_eq!(batch_grid(14), (7, 2));
+    }
+
+    #[test]
+    fn sweep_login_profiles_removes_finished_dirs_but_keeps_live() {
+        let root = std::env::temp_dir().join(format!("zpool_sweep_test_{}", uuid::Uuid::new_v4()));
+        let stale = root.join("stale-flow");
+        let live_id = format!("live-flow-{}", uuid::Uuid::new_v4());
+        let live = root.join(&live_id);
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::write(stale.join("dummy"), b"x").unwrap();
+        std::fs::write(live.join("dummy"), b"y").unwrap();
+
+        with_live_login_profiles(|s| {
+            s.insert(live_id.clone());
+        });
+        sweep_login_profiles(&root);
+        with_live_login_profiles(|s| {
+            s.remove(&live_id);
+        });
+
+        assert!(!stale.exists());
+        assert!(live.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

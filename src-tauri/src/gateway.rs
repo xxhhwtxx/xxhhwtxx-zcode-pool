@@ -9,13 +9,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const UPSTREAM: &str = "https://zcode.z.ai/api/v1/zcode-plan/anthropic";
 pub const DEFAULT_PORT: u16 = 8899;
-const SWITCH_STATUS: [u16; 4] = [401, 402, 403, 429];
-const MAX_TRIES: usize = 4;
+const SWITCH_STATUS: [u16; 5] = [401, 402, 403, 405, 429];
+const MAX_TRIES: usize = 6;
 const QUOTA_TTL_MS: u64 = 5 * 60 * 1000;
 
-const NO_QUOTA_TTL_MS: u64 = 5 * 60 * 1000;
+const NO_QUOTA_TTL_MS: u64 = 30 * 60 * 1000;
 
 const RATE_TTL_MS: u64 = 5 * 60 * 1000;
+const SHORT_RATE_TTL_MS: u64 = 60 * 1000;
+const MAX_TOKENS_LIMIT: u64 = 131_072;
 
 pub const POLICY_EXPIRE: &str = "expire_first";
 pub const POLICY_MOST_LEFT: &str = "most_left";
@@ -24,7 +26,7 @@ pub const POLICY_PINNED: &str = "pinned";
 pub const MODEL_AUTO: &str = "auto";
 pub const MODEL_PINNED: &str = "pinned";
 
-pub const EXTERNAL_MODELS: [&str; 2] = ["GLM-5.3-Flash", "GLM-5.3"];
+pub const EXTERNAL_MODELS: [&str; 3] = ["GLM-5.4", "GLM-5.3-Flash", "GLM-5.3"];
 
 const MINT_PAGE: &str = include_str!("../assets/mint.html");
 
@@ -32,39 +34,47 @@ const CHAT_PAGE: &str = include_str!("../assets/chat.html");
 
 const PROXY_PAGE: &str = include_str!("../assets/proxy.html");
 
-const CLIENT_HEADERS: [(&str, &str); 17] = [
+const CLIENT_HEADERS: [(&str, &str); 18] = [
     ("anthropic-version", "2023-06-01"),
     ("content-type", "application/json"),
     ("http-referer", "https://zcode.z.ai"),
     ("user-agent", "@UA@"),
     ("x-client-language", "zh-CN"),
     ("x-client-timezone", "Asia/Shanghai"),
-    ("x-os-category", "windows"),
-    ("x-os-version", "10.0.26200"),
-    ("x-platform", "win32-x64"),
+    ("x-os-category", "@OSCAT@"),
+    ("x-os-version", "@OSVER@"),
+    ("x-platform", "@PLAT@"),
     ("x-release-channel", "production"),
     ("x-title", "Z Code@electron"),
     ("x-zcode-agent", "glm"),
     ("x-zcode-app-version", "@VER@"),
     ("x-zcode-session-type", "main"),
+    ("x-zcode-query-source", "main_turn"),
     ("accept", "*/*"),
     ("accept-language", "*"),
     ("sec-fetch-mode", "cors"),
 ];
 
 const CAPTCHA_REGION: &str = "cn";
+const CAPTCHA_HEADER: &str = "X-Aliyun-Captcha-Verify-Param";
+const CAPTCHA_REGION_HEADER: &str = "X-Aliyun-Captcha-Verify-Region";
 
-/// 请求头里的版本号是**客户端版本**（上游会看）。
-/// 以前这里是写死的 `3.14.3` —— 客户端一升到 3.14.4，上游就把我们当旧版本挡了。
-/// 现在统一从 `quota::zcode_app_version()` 取（它先查注册表，查不到用常量兜底）。
+/// Messages 通道请求头：版本号严格锁在 `prompt::PROMPT_ALIGNED_VERSION`（3.17.2），
+/// 与 `zcode_system.json` 正文逐字节同源（参考 dengyie/zcode2api 正文锁设计，防止头新于正文触发 405/3012）。
 fn client_headers() -> Vec<(&'static str, String)> {
-    let ver = crate::quota::zcode_app_version();
+    let ver = crate::prompt::PROMPT_ALIGNED_VERSION.to_string();
+    let plat = crate::quota::client_platform();
+    let oscat = std::env::consts::OS.to_string();
+    let osver = crate::quota::os_version().unwrap_or_else(|| "10.0.26200".into());
     CLIENT_HEADERS
         .iter()
         .map(|(k, v)| {
             let v = match *v {
-                "@UA@" => format!("ZCode/{ver} ai-sdk/provider-utils/4.0.27 runtime/node.js/24"),
+                "@UA@" => format!("ZCode/{ver} ai-sdk/anthropic/3.0.81"),
                 "@VER@" => ver.clone(),
+                "@PLAT@" => plat.clone(),
+                "@OSCAT@" => oscat.clone(),
+                "@OSVER@" => osver.clone(),
                 other => other.to_string(),
             };
             (*k, v)
@@ -499,6 +509,38 @@ impl Gateway {
         g.blocked.retain(|_, t| *t > now);
         let cur = g.blocked.get(id).copied().unwrap_or(0);
         g.blocked.insert(id.to_string(), cur.max(now + ms));
+    }
+
+    fn mark_no_quota(&self, id: &str, model: &str) {
+        let mut g = self.inner.lock().unwrap();
+        let now = now_ms();
+        g.no_quota.retain(|_, t| now.saturating_sub(*t) < NO_QUOTA_TTL_MS);
+        g.no_quota.insert((id.to_string(), model_key(model)), now);
+        if g.sticky.as_deref() == Some(id) {
+            g.sticky = None;
+        }
+        if let Some((_, ov)) = g.quota.get_mut(id) {
+            for p in &mut ov.plans {
+                for it in &mut p.items {
+                    if model_same(&it.name, model) {
+                        it.remaining = Some(0.0);
+                        it.percent_used = Some(100.0);
+                    }
+                }
+            }
+            for it in &mut ov.items {
+                if model_same(&it.name, model) {
+                    it.remaining = Some(0.0);
+                    it.percent_used = Some(100.0);
+                }
+            }
+        }
+    }
+
+    fn has_mint_pool_or_waiter_consumer(&self) -> bool {
+        let g = self.inner.lock().unwrap();
+        let now = now_ms();
+        !g.params.is_empty() || now.saturating_sub(g.last_use) < ACTIVE_WINDOW_MS || self.app().is_some()
     }
 
     fn probe_one(&self, paths: &Paths, id: &str) -> Result<u64, String> {
@@ -951,6 +993,12 @@ impl Gateway {
         let accounts: Vec<(String, String)> = store::list_accounts(paths)
             .map(|v| v.into_iter().map(|a| (a.id, a.name)).collect())
             .unwrap_or_default();
+        let live_ids: std::collections::HashSet<&str> =
+            accounts.iter().map(|(id, _)| id.as_str()).collect();
+        {
+            let mut g = self.inner.lock().unwrap();
+            g.quota.retain(|id, _| live_ids.contains(id.as_str()));
+        }
         let total = accounts.len();
         let mut n = 0usize;
         let mut failed: Vec<String> = Vec::new();
@@ -1009,6 +1057,10 @@ impl Gateway {
 
     fn candidates(&self, paths: &Paths, model: &str) -> Vec<Candidate> {
         let accounts = store::list_accounts(paths).unwrap_or_default();
+        let need_warm = !accounts.is_empty() && self.inner.lock().unwrap().quota.is_empty();
+        if need_warm {
+            let _ = self.refresh_quota(paths, false);
+        }
         let secret = crate::zcrypto::default_secret(&paths.home);
         let (policy, pinned) = {
             let g = self.inner.lock().unwrap();
@@ -1042,10 +1094,10 @@ impl Gateway {
                 let g = self.inner.lock().unwrap();
                 let Some((_, ov)) = g.quota.get(&acc.id) else { continue };
                 let mut best: Option<(Option<String>, f64)> = None;
-                for p in &ov.plans {
+                let check_items = |items: &[crate::quota::QuotaItem], exp: &Option<String>, best: &mut Option<(Option<String>, f64)>| {
                     let mut here = 0.0f64;
                     let mut hit = false;
-                    for it in &p.items {
+                    for it in items {
                         if model_same(&it.name, model) {
                             let r = it.remaining.unwrap_or(0.0);
                             if r > 0.0 {
@@ -1055,20 +1107,27 @@ impl Gateway {
                         }
                     }
                     if !hit {
-                        continue;
+                        return;
                     }
-                    best = match best {
-                        None => Some((p.expire.clone(), here)),
+                    *best = match best.take() {
+                        None => Some((exp.clone(), here)),
                         Some((be, bl)) => {
-                            let sooner = matches!((&p.expire, &be), (Some(x), Some(b)) if x < b)
-                                || (p.expire.is_some() && be.is_none());
+                            let sooner = matches!((exp, &be), (Some(x), Some(b)) if x < b)
+                                || (exp.is_some() && be.is_none());
                             if sooner {
-                                Some((p.expire.clone(), here))
+                                Some((exp.clone(), here))
                             } else {
                                 Some((be, bl + here))
                             }
                         }
                     };
+                };
+                if !ov.plans.is_empty() {
+                    for p in &ov.plans {
+                        check_items(&p.items, &p.expire, &mut best);
+                    }
+                } else {
+                    check_items(&ov.items, &ov.plan_expire, &mut best);
                 }
                 match best {
                     Some(b) => b,
@@ -1249,11 +1308,394 @@ fn model_same(a: &str, b: &str) -> bool {
     !x.is_empty() && x == y
 }
 
-fn backoff_ms(attempt: usize) -> u64 {
-    let shift = attempt.saturating_sub(1).min(5) as u32;
-    let capped = 2000u64.saturating_mul(1u64 << shift).min(60_000);
-    let jitter = (now_ms() % 41) as i64 - 20; 
-    ((capped as i64) * (100 + jitter) / 100).max(50) as u64
+/// 剥离 `zai/` / `bigmodel/` 命名空间前缀，并对齐官方大小写与退役模型名（参考 dengyie/zcode2api）。
+fn normalize_request_model(raw: &str) -> String {
+    let mut m = raw.trim();
+    if let Some((pref, rest)) = m.split_once('/') {
+        if matches!(pref.trim().to_ascii_lowercase().as_str(), "zai" | "bigmodel") && !rest.trim().is_empty() {
+            m = rest.trim();
+        }
+    }
+    match m.to_ascii_lowercase().as_str() {
+        "glm-5.4" => "GLM-5.4".to_string(),
+        "glm-5.3-flash" | "glm-4.7-flash" | "glm-4.7-flashx" => "GLM-5.3-Flash".to_string(),
+        "glm-5.3" => "GLM-5.3".to_string(),
+        "glm-5.2" | "glm-5-turbo" | "glm-turbo" | "glm-5.1" | "glm-4.7" | "glm-5" => "GLM-5.4".to_string(),
+        _ => m.to_string(),
+    }
+}
+
+fn fallback_models_for(requested: &str) -> Vec<&'static str> {
+    let low = requested.trim().to_ascii_lowercase();
+    if low == "glm-5.3-flash" || low.contains("haiku") || low.contains("flash") || low.contains("mini") {
+        vec!["GLM-5.3-Flash", "GLM-5.4", "GLM-5.3"]
+    } else if low == "glm-5.3" {
+        vec!["GLM-5.3", "GLM-5.4", "GLM-5.3-Flash"]
+    } else {
+        vec!["GLM-5.4", "GLM-5.3", "GLM-5.3-Flash"]
+    }
+}
+
+fn is_date_turn_text(s: &str) -> bool {
+    s.contains("<system-reminder>") && s.contains("Today's date is")
+}
+
+fn extract_first_user_text(messages: &[Value]) -> String {
+    for msg in messages {
+        if msg.get("role").and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+        if let Some(s) = msg.get("content").and_then(Value::as_str) {
+            if !is_date_turn_text(s) && !s.trim().is_empty() {
+                return s.trim().to_string();
+            }
+        } else if let Some(arr) = msg.get("content").and_then(Value::as_array) {
+            for block in arr {
+                if block.get("type").and_then(Value::as_str) == Some("text") {
+                    if let Some(t) = block.get("text").and_then(Value::as_str) {
+                        if !is_date_turn_text(t) && !t.trim().is_empty() {
+                            return t.trim().to_string();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    String::new()
+}
+
+fn message_reads_as_query(msg: &Value) -> bool {
+    let Some(content) = msg.get("content") else { return false };
+    if let Some(s) = content.as_str() {
+        return !s.trim().is_empty() && !is_date_turn_text(s);
+    }
+    let Some(arr) = content.as_array() else { return false };
+    for block in arr {
+        let Some(obj) = block.as_object() else { continue };
+        let btype = obj.get("type").and_then(Value::as_str).unwrap_or("");
+        if btype == "tool_result" {
+            continue;
+        }
+        if btype == "text" {
+            if let Some(t) = obj.get("text").and_then(Value::as_str) {
+                if !t.trim().is_empty() && !is_date_turn_text(t) {
+                    return true;
+                }
+            }
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
+fn conversation_session_id(messages: &[Value], account_id: &str) -> String {
+    let first = extract_first_user_text(messages);
+    if first.is_empty() {
+        return account_session(account_id, &day_seed());
+    }
+    let digest: String = Sha256::digest(first.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()
+        .chars()
+        .take(32)
+        .collect();
+    let name = format!("zcode-hub:{account_id}:{digest}");
+    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, name.as_bytes()).to_string()
+}
+
+fn conversation_query_id(messages: &[Value], session_id: &str) -> Option<String> {
+    let turns = messages
+        .iter()
+        .filter(|m| m.get("role").and_then(Value::as_str) == Some("user") && message_reads_as_query(m))
+        .count();
+    if turns == 0 {
+        return None;
+    }
+    let seed = format!("zcode-query\0{session_id}\0{turns}");
+    Some(uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, seed.as_bytes()).to_string())
+}
+
+fn apply_tool_search_alias(obj: &mut serde_json::Map<String, Value>) -> bool {
+    const TOOL_SEARCH: &str = "ToolSearch";
+    const TOOL_SEARCH_ALIAS: &str = "ToolSearchTool";
+    const TOOL_PLACEHOLDER: &str = "DeferredToolPlaceholder";
+
+    let mut aliased = false;
+    if let Some(tools) = obj.get_mut("tools").and_then(Value::as_array_mut) {
+        let alias_taken = tools
+            .iter()
+            .any(|t| t.get("name").and_then(Value::as_str) == Some(TOOL_SEARCH_ALIAS));
+        let old_tools = std::mem::take(tools);
+        for mut tool in old_tools {
+            if let Some(tobj) = tool.as_object_mut() {
+                if tobj.get("name").and_then(Value::as_str) == Some(TOOL_PLACEHOLDER) {
+                    continue;
+                }
+                tobj.remove("defer_loading");
+                if !alias_taken && tobj.get("name").and_then(Value::as_str) == Some(TOOL_SEARCH) {
+                    tobj.insert("name".into(), Value::String(TOOL_SEARCH_ALIAS.to_string()));
+                    aliased = true;
+                }
+            }
+            tools.push(tool);
+        }
+    }
+    if let Some(messages) = obj.get_mut("messages").and_then(Value::as_array_mut) {
+        for msg in messages.iter_mut() {
+            if msg.get("role").and_then(Value::as_str) != Some("assistant") {
+                continue;
+            }
+            if let Some(arr) = msg.get_mut("content").and_then(Value::as_array_mut) {
+                for block in arr.iter_mut() {
+                    if let Some(bobj) = block.as_object_mut() {
+                        if bobj.get("type").and_then(Value::as_str) == Some("tool_use")
+                            && bobj.get("name").and_then(Value::as_str) == Some(TOOL_SEARCH)
+                        {
+                            bobj.insert("name".into(), Value::String(TOOL_SEARCH_ALIAS.to_string()));
+                            aliased = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    aliased
+}
+
+fn apply_cache_control_and_normalize_messages(obj: &mut serde_json::Map<String, Value>) {
+    if let Some(tools) = obj.get_mut("tools").and_then(Value::as_array_mut) {
+        for t in tools.iter_mut() {
+            if let Some(tobj) = t.as_object_mut() {
+                tobj.remove("cache_control");
+            }
+        }
+    }
+    let Some(messages) = obj.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let mut last_idx: Option<usize> = None;
+    for (idx, msg) in messages.iter_mut().enumerate() {
+        let Some(mobj) = msg.as_object_mut() else { continue };
+        if mobj.get("role").and_then(Value::as_str) == Some("system") {
+            continue;
+        }
+        last_idx = Some(idx);
+        if let Some(s) = mobj.get("content").and_then(Value::as_str).map(str::to_string) {
+            if !s.is_empty() {
+                mobj.insert("content".into(), json!([{ "type": "text", "text": s }]));
+            }
+        }
+        if let Some(arr) = mobj.get_mut("content").and_then(Value::as_array_mut) {
+            for b in arr.iter_mut() {
+                if let Some(bobj) = b.as_object_mut() {
+                    bobj.remove("cache_control");
+                }
+            }
+        }
+    }
+    if let Some(i) = last_idx {
+        if let Some(arr) = messages[i].get_mut("content").and_then(Value::as_array_mut) {
+            if let Some(last_block) = arr.last_mut().and_then(Value::as_object_mut) {
+                last_block.insert("cache_control".into(), json!({ "type": "ephemeral" }));
+            }
+        }
+    }
+}
+
+fn apply_current_date_turn(obj: &mut serde_json::Map<String, Value>) {
+    let Some(messages) = obj.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    if messages.is_empty() {
+        return;
+    }
+    let already = messages.first().is_some_and(|first| {
+        first.get("role").and_then(Value::as_str) == Some("user")
+            && first
+                .get("content")
+                .and_then(Value::as_array)
+                .and_then(|a| a.first())
+                .and_then(|b| b.get("text"))
+                .and_then(Value::as_str)
+                .is_some_and(is_date_turn_text)
+    });
+    if already {
+        return;
+    }
+    messages.insert(
+        0,
+        json!({
+            "role": "user",
+            "content": [{ "type": "text", "text": crate::prompt::current_date_reminder_text() }]
+        }),
+    );
+}
+
+fn parse_business_code(text: &str) -> Option<i64> {
+    let v: Value = serde_json::from_str(text).ok()?;
+    let code_v = v.get("code")?;
+    if let Some(n) = code_v.as_i64() {
+        return (n != 0 && n != 200).then_some(n);
+    }
+    if let Some(s) = code_v.as_str() {
+        if let Ok(n) = s.trim().parse::<i64>() {
+            return (n != 0 && n != 200).then_some(n);
+        }
+    }
+    None
+}
+
+fn is_captcha_challenge(has_header: bool, status: u16, biz_code: Option<i64>, text: &str) -> bool {
+    if has_header || biz_code == Some(3007) {
+        return true;
+    }
+    if status == 400 || status == 403 {
+        let low = text.to_ascii_lowercase();
+        return low.contains("captcha") || low.contains("verify token") || low.contains("verify failed");
+    }
+    false
+}
+
+fn is_edge_block(status: u16, biz_code: Option<i64>, text: &str) -> bool {
+    if status != 405 || biz_code == Some(3012) {
+        return false;
+    }
+    let low = text.to_ascii_lowercase();
+    if low.contains("unusual activity") || low.contains("\"code\":3012") || low.contains("\"code\": 3012") {
+        return false;
+    }
+    low.contains("address was blocked")
+        || low.contains("network's address")
+        || low.contains("blocked by the edge")
+        || low.contains("<html")
+        || low.contains("errors.aliyun.com")
+}
+
+fn is_risk_control(status: u16, biz_code: Option<i64>, text: &str) -> bool {
+    if status == 405 || biz_code == Some(3012) {
+        return true;
+    }
+    let low = text.to_ascii_lowercase();
+    low.contains("unusual activity") || low.contains("\"code\":3012") || low.contains("\"code\": 3012")
+}
+
+fn is_exhausted(status: u16, biz_code: Option<i64>, text: &str) -> bool {
+    if status == 429 || status >= 500 {
+        return false;
+    }
+    if status == 402 || matches!(biz_code, Some(1005 | 1113 | 1310)) {
+        return true;
+    }
+    let low = text.to_ascii_lowercase();
+    [
+        "exceed quota",
+        "quota limit",
+        "quota exceeded",
+        "quota exhausted",
+        "insufficient balance",
+        "insufficient quota",
+        "no balance",
+        "额度已用完",
+        "额度用完",
+        "额度不足",
+        "余额不足",
+        "余额已用完",
+        "无余额",
+        "使用上限",
+    ]
+    .iter()
+    .any(|k| low.contains(k))
+}
+
+fn is_concurrency_429(biz_code: Option<i64>, text: &str) -> bool {
+    matches!(biz_code, Some(3008 | 3009 | 3010)) || text.to_ascii_lowercase().contains("concurrency limit")
+}
+
+fn replace_bytes(hay: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(hay.len());
+    let mut i = 0usize;
+    while i < hay.len() {
+        if i + from.len() <= hay.len() && &hay[i..i + from.len()] == from {
+            out.extend_from_slice(to);
+            i += from.len();
+        } else {
+            out.push(hay[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn trailing_partial_len(buf: &[u8], pat: &[u8]) -> usize {
+    let max_k = pat.len().saturating_sub(1).min(buf.len());
+    for k in (1..=max_k).rev() {
+        if buf.ends_with(&pat[..k]) {
+            return k;
+        }
+    }
+    0
+}
+
+struct AliasReverseReader {
+    inner: Box<dyn std::io::Read + Send>,
+    pending: Vec<u8>,
+    ready: Vec<u8>,
+    ready_off: usize,
+    eof: bool,
+}
+
+impl AliasReverseReader {
+    fn new(inner: Box<dyn std::io::Read + Send>) -> Self {
+        Self {
+            inner,
+            pending: Vec::new(),
+            ready: Vec::new(),
+            ready_off: 0,
+            eof: false,
+        }
+    }
+}
+
+impl std::io::Read for AliasReverseReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        const FROM: &[u8] = b"ToolSearchTool";
+        const TO: &[u8] = b"ToolSearch";
+        if out.is_empty() {
+            return Ok(0);
+        }
+        while self.ready_off >= self.ready.len() {
+            self.ready.clear();
+            self.ready_off = 0;
+            if self.pending.is_empty() && self.eof {
+                return Ok(0);
+            }
+            if !self.eof {
+                let mut tmp = [0u8; 4096];
+                match self.inner.read(&mut tmp)? {
+                    0 => self.eof = true,
+                    n => self.pending.extend_from_slice(&tmp[..n]),
+                }
+            }
+            let replaced = replace_bytes(&self.pending, FROM, TO);
+            let hold = if self.eof { 0 } else { trailing_partial_len(&replaced, FROM) };
+            let emit_len = replaced.len().saturating_sub(hold);
+            if emit_len > 0 {
+                self.ready.extend_from_slice(&replaced[..emit_len]);
+                self.pending = replaced[emit_len..].to_vec();
+            } else {
+                self.pending = replaced;
+                if self.eof {
+                    return Ok(0);
+                }
+            }
+        }
+        let n = (self.ready.len() - self.ready_off).min(out.len());
+        out[..n].copy_from_slice(&self.ready[self.ready_off..self.ready_off + n]);
+        self.ready_off += n;
+        Ok(n)
+    }
 }
 
 fn account_session(id: &str, seed: &str) -> String {
@@ -1694,40 +2136,93 @@ fn system_blocks(paths: &Paths) -> Result<Vec<Value>, String> {
     Ok(v)
 }
 
+struct PreparedBody {
+    bytes: Vec<u8>,
+    session_id: String,
+    query_id: Option<String>,
+    effective_mid: String,
+    aliased: bool,
+}
+
 fn external_body(
     raw: &[u8],
+    account_id: &str,
     mid: &str,
     model: &str,
-    session: &str,
     paths: &Paths,
-) -> Result<Vec<u8>, (u16, String)> {
+) -> Result<PreparedBody, (u16, String)> {
     let mut v: Value = serde_json::from_slice(raw)
         .map_err(|e| (400, format!("请求体必须是 UTF-8 编码的 JSON：{e}")))?;
     let obj = v
         .as_object_mut()
         .ok_or_else(|| (400, "请求体必须是 JSON 对象".to_string()))?;
     obj.insert("model".into(), json!(model));
-    obj.entry("max_tokens").or_insert(json!(8192));
+
+    let clamped_max = match obj.get("max_tokens").and_then(|x| x.as_u64()) {
+        Some(n) => n.clamp(1, MAX_TOKENS_LIMIT),
+        None => 8192,
+    };
+    obj.insert("max_tokens".into(), json!(clamped_max));
+
+    let orig_msgs = obj
+        .get("messages")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let session_id = conversation_session_id(&orig_msgs, account_id);
+    let query_id = conversation_query_id(&orig_msgs, &session_id);
+
+    let has_skill = obj
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|arr| arr.iter().any(|t| t.get("name").and_then(Value::as_str) == Some("Skill")));
 
     let caller = obj.get("system").cloned();
-    let mut blocks = system_blocks(paths).map_err(|e| (503, e))?;
-    match caller {
-        Some(Value::String(s)) if !s.trim().is_empty() => {
-            blocks.push(json!({ "type": "text", "text": s }))
-        }
-        Some(Value::Array(a)) => blocks.extend(a.into_iter()),
-        _ => {}
-    }
+    let platform = crate::quota::client_platform();
+    let osver = crate::quota::os_version().unwrap_or_else(|| "10.0.26200".into());
+    let blocks = match crate::prompt::build_start_plan_system(
+        caller.as_ref(),
+        Some(model),
+        has_skill,
+        &platform,
+        &osver,
+    ) {
+        Ok(b) => b,
+        Err(_) => system_blocks(paths).map_err(|e| (503, e))?,
+    };
     obj.insert("system".into(), Value::Array(blocks));
 
+    let aliased = apply_tool_search_alias(obj);
+    apply_cache_control_and_normalize_messages(obj);
+    apply_current_date_turn(obj);
+
+    let effective_mid = if mid.trim().is_empty() {
+        account_session(account_id, "device-mid")
+    } else {
+        mid.trim().to_string()
+    };
     let uid = json!({
-        "device_id": mid,
+        "device_id": effective_mid,
         "account_uuid": "",
-        "session_id": session,
+        "session_id": session_id,
     })
     .to_string();
-    obj.insert("metadata".into(), json!({ "user_id": uid }));
-    serde_json::to_vec(&v).map_err(|e| (500, e.to_string()))
+    let mut meta = obj
+        .get("metadata")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    meta.insert("user_id".into(), Value::String(uid));
+    obj.insert("metadata".into(), Value::Object(meta));
+
+    let bytes = serde_json::to_vec(&v).map_err(|e| (500, e.to_string()))?;
+    Ok(PreparedBody {
+        bytes,
+        session_id,
+        query_id,
+        effective_mid,
+        aliased,
+    })
 }
 
 fn handle_external(
@@ -1748,9 +2243,10 @@ fn handle_external(
                                 "message": "对外接口没开 —— 到工具的「反代」页打开它" } }),
         );
     }
-    let mut model = body_model(body).unwrap_or_else(|| EXTERNAL_MODELS[0].to_string());
+    let raw_model = body_model(body).unwrap_or_else(|| EXTERNAL_MODELS[0].to_string());
+    let client_model = raw_model.clone();
+    let mut model = normalize_request_model(&raw_model);
 
-    let client_model = model.clone();
     let (mmode, mpin) = {
         let g = gw.inner.lock().unwrap();
         (g.model_mode.clone(), g.model_pinned.clone())
@@ -1758,14 +2254,22 @@ fn handle_external(
 
     if mmode == MODEL_PINNED {
         if let Some(p) = mpin.clone().filter(|x| !x.trim().is_empty()) {
-            if p != model {
-                crate::flowlog::log("relay", "model-pinned", &format!("请求={model} 指定={p}"));
+            let norm_p = normalize_request_model(&p);
+            if norm_p != model {
+                crate::flowlog::log("relay", "model-pinned", &format!("请求={model} 指定={norm_p}"));
             }
-            model = p;
+            model = norm_p;
         }
     }
 
-    let mapped = gw.inner.lock().unwrap().model_map.get(&model).cloned();
+    let mapped = {
+        let g = gw.inner.lock().unwrap();
+        g.model_map
+            .get(&model)
+            .or_else(|| g.model_map.get(&raw_model))
+            .cloned()
+    }
+    .map(|s| normalize_request_model(&s));
     if let Some(to) = mapped.clone() {
         crate::flowlog::log("relay", "model-map", &format!("请求={model} 上游={to}"));
         model = to;
@@ -1809,11 +2313,10 @@ fn handle_external(
     let mut cands = gw.sticky_order(gw.candidates(paths, &model));
 
     if cands.is_empty() && mmode == MODEL_AUTO {
-        for alt in EXTERNAL_MODELS.iter().filter(|m| **m != model) {
+        for alt in fallback_models_for(&model).into_iter().filter(|m| !m.eq_ignore_ascii_case(&model)) {
             let c2 = gw.sticky_order(gw.candidates(paths, alt));
             if !c2.is_empty() {
-                crate::flowlog::log("relay", "model-fallback", &format!("{model} 全库无额度 → 回退到 {alt}"));
-
+                crate::flowlog::log("relay", "model-fallback", &format!("{model} 无直接额度 → 使用 {alt}"));
                 model = alt.to_string();
                 cands = c2;
                 break;
@@ -1821,7 +2324,6 @@ fn handle_external(
         }
     }
     if cands.is_empty() {
-
         let at = now_ms();
         crate::usage::append(&usage_path, &mk("", 502, "no-account", 0, false, at));
         return reply_json(
@@ -1829,41 +2331,23 @@ fn handle_external(
             502,
             &json!({ "type": "error",
                      "error": { "type": "overloaded_error",
-                                "message": format!("号池里没有可用于 {model} 的号") } }),
+                                "message": format!("号池里没有可用于 {model} 的号（请先刷新额度或检查可用账号）") } }),
         );
     }
 
     let mut tried = 0usize;
-
     let mut last_abnormal: Option<(u16, Option<String>, Vec<u8>, Box<dyn std::io::Read + Send>)> = None;
-
     let mut last_acct = String::new();
     let mut last_at = now_ms();
-    for c in cands.iter().take(MAX_TRIES) {
-        tried += 1;
+    let mut last_err_detail = String::new();
+    let mut captcha_param: Option<(String, String)> = None;
 
-        // 2026-09-30 实测：**上游不再要求模型请求带一次性验证码**。
-        //   带 → 200；不带（连打 5 发）→ 200；两者速度无可测差异
-        //   （TTFB 中位差 36ms，远小于单次抖动 800~2100ms）。官方 3.14.4 更新日志也写了
-        //   「关闭模型请求验证码校验」。所以这里不再取码、不再发那两个头。
-        //
-        // 副作用（正面的）：取码是**按需**的（`want_mint` 看 `waiters` / `last_use`），
-        //   而 `last_use` 只由 `take_param` 更新 —— 不调它，180 秒后取码自动停，
-        //   阿里云那边不再按次计费，也不用再动取码循环。
-        //
-        // ⚠ 领取套餐用的是**另一套**验证码（captcha.html 独立窗口 → claim_captcha_submit），
-        //   不经过这里，**别一起删**。
-        // 万一上游又要求了（症状：401/3012 且日志里没有 no-param 记录），恢复下面这段即可：
-        //   let (param, region) = gw.take_param()?; // 并在下面的链式 .set 里带上这两个头
-        let sess = account_session(&c.id, &day_seed());
-        let out_body = match external_body(body, &c.mid, &model, &sess, paths) {
+    'cand_loop: for c in cands.iter().take(MAX_TRIES) {
+        tried += 1;
+        let prep = match external_body(body, &c.id, &c.mid, &model, paths) {
             Ok(b) => b,
             Err((code, e)) => {
-                let ty = if code >= 500 {
-                    "api_error"
-                } else {
-                    "invalid_request_error"
-                };
+                let ty = if code >= 500 { "api_error" } else { "invalid_request_error" };
                 crate::usage::append(&usage_path, &mk(&c.name, code, "bad-body", tried, false, now_ms()));
                 return reply_json(
                     slot.take().unwrap(),
@@ -1873,157 +2357,252 @@ fn handle_external(
             }
         };
 
-        let mut call = agent.request("POST", &target);
-        for (k, v) in client_headers() {
-            call = call.set(k, &v);
-        }
-        call = call
-            .set("authorization", &format!("Bearer {}", c.token))
-            .set("x-api-key", &c.token)
-            // 注：以前这里还有 x-aliyun-captcha-verify-param / -region 两个头，
-            // 2026-09-30 起不再发（上游已关闭模型请求的验证码校验，见上方说明）。
-            .set("x-query-id", &uuid::Uuid::now_v7().to_string())
-            .set("x-request-id", &uuid::Uuid::new_v4().to_string())
-            .set("x-session-id", &uuid::Uuid::new_v4().to_string())
-            .set("x-zcode-trace-id", &uuid::Uuid::new_v4().to_string());
+        let mut inner_retries = 0usize;
+        let mut captcha_retried = false;
+        loop {
+            let mut call = agent.request("POST", &target);
+            for (k, v) in client_headers() {
+                call = call.set(k, &v);
+            }
+            call = call
+                .set("authorization", &format!("Bearer {}", c.token))
+                .set("X-Device-Mid", &prep.effective_mid)
+                .set("x-request-id", &uuid::Uuid::new_v4().to_string())
+                .set("x-session-id", &prep.session_id)
+                .set("x-zcode-trace-id", &uuid::Uuid::new_v4().to_string());
+            if let Some(ref qid) = prep.query_id {
+                call = call.set("x-query-id", qid);
+            }
+            if let Some((ref param, ref region)) = captcha_param {
+                call = call
+                    .set(CAPTCHA_HEADER, param)
+                    .set(CAPTCHA_REGION_HEADER, region);
+            }
 
-        let tried_at = now_ms();
-        last_acct = c.name.clone();
-        last_at = tried_at;
-        let (status, reader, ctype) = match call.send_bytes(&out_body) {
-            Ok(r) => {
-                let ct = r.header("Content-Type").map(|s| s.to_string());
-                (r.status(), r.into_reader(), ct)
+            let tried_at = now_ms();
+            last_acct = c.name.clone();
+            last_at = tried_at;
+            let (status, has_captcha_hdr, reader, ctype) = match call.send_bytes(&prep.bytes) {
+                Ok(r) => {
+                    let ct = r.header("Content-Type").map(|s| s.to_string());
+                    let ch = r.header(CAPTCHA_HEADER).is_some_and(|v| !v.trim().is_empty());
+                    (r.status(), ch, r.into_reader(), ct)
+                }
+                Err(ureq::Error::Status(code, r)) => {
+                    let ct = r.header("Content-Type").map(|s| s.to_string());
+                    let ch = r.header(CAPTCHA_HEADER).is_some_and(|v| !v.trim().is_empty());
+                    (code, ch, r.into_reader(), ct)
+                }
+                Err(e) => {
+                    last_err_detail = format!("{}: 网络失败 {e}", c.name);
+                    crate::flowlog::log("relay", "external-fail", &last_err_detail);
+                    gw.mark_blocked(&c.id, SHORT_RATE_TTL_MS);
+                    continue 'cand_loop;
+                }
+            };
+
+            let ct_lower = ctype.as_deref().unwrap_or("").to_ascii_lowercase();
+            let mut reader: Box<dyn std::io::Read + Send> = Box::new(reader);
+
+            let check_json_or_err = status >= 400 || (status == 200 && !ct_lower.contains("event-stream"));
+            if check_json_or_err {
+                let mut err_buf = Vec::new();
+                let _ = reader.by_ref().take(65_536).read_to_end(&mut err_buf);
+                let err_txt = String::from_utf8_lossy(&err_buf).to_string();
+                let biz_code = parse_business_code(&err_txt);
+                let short_snip: String = err_txt.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(180).collect();
+
+                if status == 200 && biz_code.is_none() && peek_model(&err_buf).is_some() {
+                    reader = Box::new(std::io::Cursor::new(err_buf).chain(reader));
+                } else if status >= 400 || biz_code.is_some() {
+                    if is_captcha_challenge(has_captcha_hdr, status, biz_code, &err_txt) && !captcha_retried {
+                        captcha_retried = true;
+                        captcha_param = None;
+                        if gw.has_mint_pool_or_waiter_consumer() {
+                            if let Ok((p, reg)) = gw.take_param() {
+                                crate::flowlog::log("relay", "captcha-retry", &format!("{} 触发人机校验，已取码重试", c.name));
+                                captcha_param = Some((p, reg));
+                                continue;
+                            }
+                        }
+                        last_err_detail = format!("{} 需要人机校验（HTTP {status}）：{short_snip}", c.name);
+                        crate::flowlog::log("relay", "captcha-skip", &last_err_detail);
+                        continue 'cand_loop;
+                    }
+
+                    if is_edge_block(status, biz_code, &err_txt) {
+                        crate::flowlog::log("relay", "edge-block", &format!("{} HTTP 405 边缘 IP 封禁：{short_snip}", c.name));
+                        crate::usage::append(&usage_path, &mk(&c.name, 503, "edge-405", tried, false, tried_at));
+                        return reply_json(
+                            slot.take().unwrap(),
+                            503,
+                            &json!({ "type": "error",
+                                     "error": { "type": "api_error",
+                                                "message": "上游返回边缘 IP 封禁页（HTTP 405），请在控制台「出站代理」更换出口代理后重试" } }),
+                        );
+                    }
+
+                    if is_exhausted(status, biz_code, &err_txt) {
+                        last_err_detail = format!("{} 额度耗尽（HTTP {status}）：{short_snip}", c.name);
+                        crate::flowlog::log("relay", "exhausted", &last_err_detail);
+                        gw.mark_no_quota(&c.id, &model);
+                        continue 'cand_loop;
+                    }
+
+                    if status == 429 && is_concurrency_429(biz_code, &err_txt) && inner_retries < 2 {
+                        inner_retries += 1;
+                        let wait = 1200 + (inner_retries as u64) * 1000;
+                        crate::flowlog::log("relay", "concurrency-retry", &format!("{} HTTP 429 并发争用（{inner_retries}/2），退避 {wait}ms", c.name));
+                        std::thread::sleep(Duration::from_millis(wait));
+                        continue;
+                    }
+
+                    if status == 429 {
+                        last_err_detail = format!("{} HTTP 429：{short_snip}", c.name);
+                        let cool = if is_concurrency_429(biz_code, &err_txt) { 15_000 } else { SHORT_RATE_TTL_MS };
+                        gw.mark_blocked(&c.id, cool);
+                        crate::flowlog::log("relay", "switch", &last_err_detail);
+                        continue 'cand_loop;
+                    }
+
+                    if is_risk_control(status, biz_code, &err_txt) {
+                        last_err_detail = format!("{} 风控 HTTP {status} code={}：{short_snip}", c.name, biz_code.map_or("-".into(), |x| x.to_string()));
+                        gw.mark_blocked(&c.id, RATE_TTL_MS);
+                        crate::flowlog::log("relay", "risk-3012", &last_err_detail);
+                        continue 'cand_loop;
+                    }
+
+                    if status >= 500 && inner_retries == 0 {
+                        inner_retries += 1;
+                        std::thread::sleep(Duration::from_millis(1200));
+                        continue;
+                    }
+
+                    if SWITCH_STATUS.contains(&status) || status >= 500 {
+                        last_err_detail = format!("{} HTTP {status}：{short_snip}", c.name);
+                        gw.mark_blocked(&c.id, SHORT_RATE_TTL_MS);
+                        crate::flowlog::log("relay", "switch", &last_err_detail);
+                        continue 'cand_loop;
+                    }
+
+                    // 4xx request error (e.g. 400 invalid params) -> return directly to client
+                    crate::flowlog::log("relay", "client-4xx", &format!("{} HTTP {status}: {short_snip}", c.name));
+                    crate::usage::append(&usage_path, &mk(&c.name, status, &biz_code.map(|x| x.to_string()).unwrap_or_default(), tried, false, tried_at));
+                    let mut hs = vec![];
+                    if let Some(ct) = ctype {
+                        if let Ok(h) = tiny_http::Header::from_bytes(&b"Content-Type"[..], ct.as_bytes()) {
+                            hs.push(h);
+                        }
+                    }
+                    let rd = std::io::Cursor::new(err_buf);
+                    let _ = slot.take().unwrap().respond(tiny_http::Response::new(
+                        tiny_http::StatusCode(status), hs, rd, None, None,
+                    ));
+                    return Ok(());
+                } else {
+                    last_err_detail = format!("{} 异常响应 HTTP {status}：{short_snip}", c.name);
+                    last_abnormal = Some((status, ctype.clone(), err_buf, reader));
+                    continue 'cand_loop;
+                }
             }
-            Err(ureq::Error::Status(code, r)) => {
-                let ct = r.header("Content-Type").map(|s| s.to_string());
-                (code, r.into_reader(), ct)
+
+            let stream = ct_lower.contains("event-stream");
+            let mut up: Option<String> = None;
+            if status == 200 {
+                let mut head: Vec<u8> = Vec::new();
+                let mut buf = vec![0u8; 2048];
+                let mut ended = false;
+                for _ in 0..6 {
+                    match reader.read(&mut buf) {
+                        Ok(0) => { ended = true; break; }
+                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                        Err(_) => { ended = true; break; }
+                    }
+                    if peek_model(&head).is_some() || head.len() >= 4096 { break; }
+                }
+                up = peek_model(&head);
+                let txt = String::from_utf8_lossy(&head).to_lowercase();
+                if up.is_none() && (ended || !stream || txt.contains("\"error\"") || txt.contains("\"code\"")) {
+                    let short: String = String::from_utf8_lossy(&head).chars().take(200).collect();
+                    last_err_detail = format!("{} 响应非模型流：{short}", c.name);
+                    crate::flowlog::log("relay", "abnormal", &last_err_detail);
+                    last_abnormal = Some((status, ctype.clone(), head, reader));
+                    continue 'cand_loop;
+                }
+                reader = Box::new(std::io::Cursor::new(head).chain(reader));
             }
-            Err(e) => {
-                crate::flowlog::log("relay", "external-fail", &format!("{} {e}", c.name));
-                gw.mark_blocked(&c.id, RATE_TTL_MS);
-                std::thread::sleep(Duration::from_millis(backoff_ms(tried)));
-                continue;
+            if prep.aliased {
+                reader = Box::new(AliasReverseReader::new(reader));
             }
-        };
-        if SWITCH_STATUS.contains(&status) {
-            if status == 429 {
-                gw.mark_blocked(&c.id, RATE_TTL_MS);
+
+            gw.set_sticky(&c.id);
+            {
+                let mut g = gw.inner.lock().unwrap();
+                g.served += 1;
+                if tried > 1 {
+                    g.switched += 1;
+                }
+                g.last_route = Some(Route {
+                    account: c.id.clone(),
+                    model: model.clone(),
+                    tries: tried,
+                });
             }
-            let d = backoff_ms(tried);
             crate::flowlog::log(
                 "relay",
-                "switch",
-                &format!("外部 {} HTTP {status} → 冷却/换下一个（退避 {d}ms）", c.name),
+                "external-ok",
+                &format!("{} HTTP {status} model={model} tries={tried} len={}", c.name, prep.bytes.len()),
             );
-            std::thread::sleep(Duration::from_millis(d));
-            continue;
-        }
 
-        let stream = ctype.as_deref().unwrap_or("").to_ascii_lowercase().contains("event-stream");
-        let mut up: Option<String> = None;
-        let mut reader: Box<dyn std::io::Read + Send> = Box::new(reader);
-        if status == 200 {
-            let ct_lower = ctype.as_deref().unwrap_or("").to_ascii_lowercase();
-            let mut head: Vec<u8> = Vec::new();
-            let mut buf = vec![0u8; 2048];
-            let mut ended = false;
-            for _ in 0..6 {
-                match reader.read(&mut buf) {
-                    Ok(0) => { ended = true; break; }
-                    Ok(n) => head.extend_from_slice(&buf[..n]),
-                    Err(_) => { ended = true; break; }
+            let mut hs: Vec<tiny_http::Header> = vec![];
+            if let Some(ct) = ctype {
+                if let Ok(h) = tiny_http::Header::from_bytes(&b"Content-Type"[..], ct.as_bytes()) {
+                    hs.push(h);
                 }
-                if peek_model(&head).is_some() || head.len() >= 4096 { break; }
             }
-
-            up = peek_model(&head);
-            let txt = String::from_utf8_lossy(&head).to_lowercase();
-            if up.is_none()
-                && (ended || !ct_lower.contains("event-stream")
-                    || txt.contains("\"error\"") || txt.contains("\"code\""))
-            {
-                let short: String = String::from_utf8_lossy(&head).chars().take(200).collect();
-                crate::flowlog::log("relay", "abnormal",
-                    &format!("外部 {} ctype={ct_lower} 响应不像模型流，换下一个：{short}", c.name));
-                last_abnormal = Some((status, ctype.clone(), head, reader));
-                continue;
+            for (k, v) in [
+                ("x-relay-account", c.name.clone()),
+                ("x-relay-tries", tried.to_string()),
+            ] {
+                if let Ok(h) = tiny_http::Header::from_bytes(k.as_bytes(), v.as_bytes()) {
+                    hs.push(h);
+                }
             }
-            reader = Box::new(std::io::Cursor::new(head).chain(reader));
-        }
-        gw.set_sticky(&c.id);
-        {
-            let mut g = gw.inner.lock().unwrap();
-            g.served += 1;
-            if tried > 1 {
-                g.switched += 1;
-            }
-            g.last_route = Some(Route {
-                account: c.id.clone(),
-                model: model.clone(),
-                tries: tried,
-            });
-        }
-        crate::flowlog::log(
-            "relay",
-            "external-ok",
-            &format!(
-                "{} HTTP {status} model={model} tries={tried} len={}",
-                c.name,
-                out_body.len()
-            ),
-        );
-
-        let mut hs: Vec<tiny_http::Header> = vec![];
-        if let Some(ct) = ctype {
-            if let Ok(h) = tiny_http::Header::from_bytes(&b"Content-Type"[..], ct.as_bytes()) {
-                hs.push(h);
-            }
-        }
-        for (k, v) in [
-            ("x-relay-account", c.name.clone()),
-            ("x-relay-tries", tried.to_string()),
-        ] {
-            if let Ok(h) = tiny_http::Header::from_bytes(k.as_bytes(), v.as_bytes()) {
-                hs.push(h);
-            }
-        }
-        let reader: Box<dyn std::io::Read + Send> = Box::new(Meter {
-            inner: gw.inner.clone(),
-            src: reader,
-            tail: Vec::new(),
-            head: Vec::new(),
-            tokens: 0,
-            tokens_in: 0,
-            cache: 0,
-            bytes: 0,
-            started: tried_at,
-            first_at: None,
-
-            rec: Some(crate::usage::UsageRecord {
-                t: tried_at,
-                acct: c.name.clone(),
-                model: client_model.clone(),
-                up,
+            let reader: Box<dyn std::io::Read + Send> = Box::new(Meter {
+                inner: gw.inner.clone(),
+                src: reader,
+                tail: Vec::new(),
+                head: Vec::new(),
+                tokens: 0,
                 tokens_in: 0,
-                tokens_out: 0,
                 cache: 0,
-                ttfb: None,
-                ms: 0,
                 bytes: 0,
-                status,
-                code: String::new(),
-                tries: tried,
-                stream,
-                mapped: mapped.clone(),
-                key: key_tag.to_string(),
-            }),
-            path: usage_path.clone(),
-        });
-        let resp =
-            tiny_http::Response::new(tiny_http::StatusCode(status), hs, reader, None, None);
-        let _ = slot.take().unwrap().respond(resp);
-        return Ok(());
+                started: tried_at,
+                first_at: None,
+                rec: Some(crate::usage::UsageRecord {
+                    t: tried_at,
+                    acct: c.name.clone(),
+                    model: client_model.clone(),
+                    up,
+                    tokens_in: 0,
+                    tokens_out: 0,
+                    cache: 0,
+                    ttfb: None,
+                    ms: 0,
+                    bytes: 0,
+                    status,
+                    code: String::new(),
+                    tries: tried,
+                    stream,
+                    mapped: mapped.clone(),
+                    key: key_tag.to_string(),
+                }),
+                path: usage_path.clone(),
+            });
+            let resp = tiny_http::Response::new(tiny_http::StatusCode(status), hs, reader, None, None);
+            let _ = slot.take().unwrap().respond(resp);
+            return Ok(());
+        }
     }
 
     if let Some((status, ctype, head, reader)) = last_abnormal {
@@ -2033,7 +2612,6 @@ fn handle_external(
                 hs.push(h);
             }
         }
-
         let mut rec = mk(
             &last_acct,
             status,
@@ -2053,12 +2631,16 @@ fn handle_external(
         return Ok(());
     }
     crate::usage::append(&usage_path, &mk(&last_acct, 502, "rejected", tried, false, last_at));
+    let msg = if last_err_detail.is_empty() {
+        format!("试了 {tried} 个号都被拒")
+    } else {
+        format!("试了 {tried} 个号都被拒（最后错误：{last_err_detail}）")
+    };
     reply_json(
         slot.take().unwrap(),
         502,
         &json!({ "type": "error",
-                 "error": { "type": "overloaded_error",
-                            "message": format!("试了 {tried} 个号都被拒") } }),
+                 "error": { "type": "overloaded_error", "message": msg } }),
     )
 }
 
@@ -2375,7 +2957,8 @@ fn handle(mut req: tiny_http::Request, gw: &Gateway) -> Result<(), String> {
         p if p == "/v1/models" || p == "/models" || p.starts_with("/v1/models/") || p.starts_with("/models/") => {
             let one = p.rsplit('/').next().unwrap_or("");
             let want = if p.starts_with("/v1/models/") || p.starts_with("/models/") {
-                EXTERNAL_MODELS.iter().find(|m| m.eq_ignore_ascii_case(one)).copied()
+                let norm = normalize_request_model(one);
+                EXTERNAL_MODELS.iter().find(|m| m.eq_ignore_ascii_case(&norm) || m.eq_ignore_ascii_case(one)).copied()
             } else {
                 None
             };
@@ -2766,4 +3349,114 @@ fn handle(mut req: tiny_http::Request, gw: &Gateway) -> Result<(), String> {
             .with_status_code(404),
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_normalization_handles_namespaces_aliases_and_case() {
+        assert_eq!(normalize_request_model("zai/glm-5.4"), "GLM-5.4");
+        assert_eq!(normalize_request_model("bigmodel/glm-5.3-flash"), "GLM-5.3-Flash");
+        assert_eq!(normalize_request_model("GLM-5.2"), "GLM-5.4");
+        assert_eq!(normalize_request_model("glm-5-turbo"), "GLM-5.4");
+        assert_eq!(fallback_models_for("claude-haiku-4-5")[0], "GLM-5.3-Flash");
+        assert_eq!(fallback_models_for("claude-sonnet-4-5")[0], "GLM-5.4");
+    }
+
+    #[test]
+    fn attribution_session_and_query_ids_ignore_date_turn_and_tool_results() {
+        let msgs = vec![
+            json!({ "role": "user", "content": "fix bug" }),
+            json!({ "role": "assistant", "content": [{ "type": "tool_use", "id": "t1", "name": "Read", "input": {} }] }),
+            json!({ "role": "user", "content": [{ "type": "tool_result", "tool_use_id": "t1", "content": "ok" }] }),
+        ];
+        let mut with_date = vec![json!({
+            "role": "user",
+            "content": [{ "type": "text", "text": "<system-reminder>Today's date is 2026-11-24.</system-reminder>" }]
+        })];
+        with_date.extend(msgs.clone());
+
+        let s1 = conversation_session_id(&msgs, "acc1");
+        let s2 = conversation_session_id(&with_date, "acc1");
+        assert_eq!(s1, s2);
+        assert_ne!(s1, conversation_session_id(&msgs, "acc2"));
+        assert_eq!(
+            conversation_query_id(&msgs, &s1),
+            conversation_query_id(&with_date, &s1)
+        );
+    }
+
+    #[test]
+    fn external_body_shapes_three_blocks_date_turn_cache_and_tool_search_alias() {
+        let raw = json!({
+            "model": "GLM-5.4",
+            "max_tokens": 999_999,
+            "system": "Custom prompt",
+            "tools": [
+                { "name": "ToolSearch", "description": "s", "defer_loading": true, "cache_control": { "type": "ephemeral" } },
+                { "name": "DeferredToolPlaceholder", "description": "p" },
+                { "name": "Skill", "description": "sk" }
+            ],
+            "messages": [
+                { "role": "user", "content": "hello" }
+            ]
+        });
+        let paths = Paths { home: std::env::temp_dir().join("zpool-gw-test") };
+        let prep = external_body(&serde_json::to_vec(&raw).unwrap(), "a1", "mid1", "GLM-5.4", &paths).unwrap();
+        assert!(prep.aliased);
+        let v: Value = serde_json::from_slice(&prep.bytes).unwrap();
+        assert_eq!(v["max_tokens"].as_u64(), Some(MAX_TOKENS_LIMIT));
+        let sys = v["system"].as_array().unwrap();
+        assert_eq!(sys.len(), 3);
+        assert!(sys[2]["text"].as_str().unwrap().contains("Custom prompt"));
+        let tools = v["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["name"].as_str(), Some("ToolSearchTool"));
+        assert!(tools[0].get("defer_loading").is_none());
+        assert!(tools[0].get("cache_control").is_none());
+        let msgs = v["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert!(msgs[0]["content"][0]["text"].as_str().unwrap().contains("Today's date is"));
+        assert_eq!(msgs[1]["content"][0]["cache_control"]["type"].as_str(), Some("ephemeral"));
+        let uid: Value = serde_json::from_str(v["metadata"]["user_id"].as_str().unwrap()).unwrap();
+        assert_eq!(uid["session_id"].as_str(), Some(prep.session_id.as_str()));
+        assert_eq!(uid["device_id"].as_str(), Some("mid1"));
+    }
+
+    #[test]
+    fn business_error_and_edge_block_classification_matches_zcode2api() {
+        assert_eq!(parse_business_code(r#"{"code":3012,"msg":"unusual"}"#), Some(3012));
+        assert_eq!(parse_business_code(r#"{"code":0,"msg":"ok"}"#), None);
+        assert!(is_edge_block(405, None, "<html>errors.aliyun.com</html>"));
+        assert!(!is_edge_block(405, Some(3012), r#"{"code":3012,"msg":"unusual activity"}"#));
+        assert!(is_risk_control(405, Some(3012), r#"{"code":3012,"msg":"unusual activity"}"#));
+        assert!(is_exhausted(200, Some(1005), r#"{"code":1005,"msg":"exceed quota limit"}"#));
+        assert!(!is_exhausted(429, Some(3009), r#"{"code":3009,"msg":"model concurrency limit"}"#));
+        assert!(is_concurrency_429(Some(3009), r#"{"logid":"30099999"}"#));
+        assert!(is_captcha_challenge(false, 400, Some(3007), r#"{"code":3007}"#));
+    }
+
+    #[test]
+    fn alias_reverse_reader_replaces_split_chunks_cleanly() {
+        struct ChunkReader(Vec<&'static [u8]>, usize);
+        impl std::io::Read for ChunkReader {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                if self.1 >= self.0.len() {
+                    return Ok(0);
+                }
+                let src = self.0[self.1];
+                self.1 += 1;
+                let n = src.len().min(out.len());
+                out[..n].copy_from_slice(&src[..n]);
+                Ok(n)
+            }
+        }
+        let cr = ChunkReader(vec![b"{\"name\":\"Tool", b"SearchTool\",\"ok\":true}"], 0);
+        let mut r = AliasReverseReader::new(Box::new(cr));
+        let mut out = String::new();
+        r.read_to_string(&mut out).unwrap();
+        assert_eq!(out, r#"{"name":"ToolSearch","ok":true}"#);
+    }
 }

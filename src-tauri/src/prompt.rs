@@ -6,18 +6,137 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-const PROMPT_PREFIX: &str = "You are ZCode, an interactive coding agent";
+/// Messages 通道提示词正文锁对齐版本（来自 dengyie/zcode2api zcode_system.json 3.17.2）。
+/// 上游会校验 User-Agent / X-ZCode-App-Version 与前两块 system 正文同版；头比正文新会直接 405/3012。
+pub const PROMPT_ALIGNED_VERSION: &str = "3.17.2";
+const ZCODE_SYSTEM_JSON: &str = include_str!("../assets/zcode_system.json");
 
-/// 服务端只校验到身份段为止：`system` 必须恰好是「固定前缀 + 身份段」两块，且逐字节相等。
-/// 身份段之后的 Desktop Context / Session guidance / Environment / Context management
-/// 全部可有可无（实测：把它们整段删掉照样 200，改动身份段里任意一个字符就 3012）。
-///
-/// 所以这里**有意只发这两块**。被丢掉的那些段落要么点名客户端专属的东西
-/// （`::code-comment` 指令、`/<skill>` 走 Skill 工具），要么把本机路径、
-/// 伪造的环境信息塞进每一次请求里 —— 对第三方客户端全是噪音。
-const IDENTITY_PREFIX: &str = "You are an interactive ZCode agent";
+const PROMPT_PREFIX: &str = "You are ZCode, an interactive agent";
+const LEGACY_PROMPT_PREFIX: &str = "You are ZCode, an interactive coding agent";
+
+const IDENTITY_PREFIX: &str = "You are an agent working with the user";
+const LEGACY_IDENTITY_PREFIX: &str = "You are an interactive ZCode agent";
 
 const OVERRIDE_NAME: &str = "system_prompt.json";
+
+fn embedded_prompt_spec() -> Result<Value, String> {
+    serde_json::from_str(ZCODE_SYSTEM_JSON).map_err(|e| format!("内嵌 zcode_system.json 解析失败：{e}"))
+}
+
+pub fn current_date_reminder_text() -> String {
+    let line = embedded_prompt_spec()
+        .ok()
+        .and_then(|v| v.pointer("/context/currentDateLine").and_then(Value::as_str).map(String::from))
+        .unwrap_or_else(|| "Today's date is {date}.".to_string());
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    format!("<system-reminder>{}</system-reminder>", line.replace("{date}", &today))
+}
+
+fn normalize_user_system(caller: Option<&Value>) -> Vec<String> {
+    let mut out = Vec::new();
+    match caller {
+        Some(Value::String(s)) if !s.trim().is_empty() => out.push(s.clone()),
+        Some(Value::Array(arr)) => {
+            for item in arr {
+                if let Some(s) = item.as_str() {
+                    if !s.trim().is_empty() {
+                        out.push(s.to_string());
+                    }
+                } else if let Some(obj) = item.as_object() {
+                    if obj.get("type").and_then(Value::as_str) == Some("text") {
+                        if let Some(t) = obj.get("text").and_then(Value::as_str) {
+                            if !t.trim().is_empty() {
+                                out.push(t.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+fn get_env_str<'a>(e: Option<&'a serde_json::Map<String, Value>>, k: &str, def: &'a str) -> &'a str {
+    e.and_then(|m| m.get(k))
+        .and_then(Value::as_str)
+        .unwrap_or(def)
+}
+
+fn build_environment_text(spec: &Value, platform: &str, os_version: &str) -> String {
+    let e = spec.get("environment").and_then(Value::as_object);
+    let (plat, arch) = platform.split_once('-').unwrap_or(("win32", "x64"));
+    [
+        get_env_str(e, "heading", "# Environment").to_string(),
+        get_env_str(e, "invokedLine", "You have been invoked in the following environment: ").to_string(),
+        format!(" - {}: {}", get_env_str(e, "platformLabel", "Platform"), plat),
+        format!(" - {}: {} {} {}", get_env_str(e, "osVersionLabel", "OS Version"), plat, os_version, arch),
+        format!(" - {}", get_env_str(e, "untrustedNote", "")),
+    ]
+    .join("\n")
+}
+
+/// 对齐 dengyie/zcode2api `apply_start_plan_system`：
+/// 严格输出 3 块 `cache_control: ephemeral`（cliPrefix / stableSections / dynamic），
+/// 客户端自己的 system 文本只并入第 3 块末尾，避免第 4 块破坏官方形态触发 405/3012。
+pub fn build_start_plan_system(
+    caller: Option<&Value>,
+    model: Option<&str>,
+    has_skill: bool,
+    platform: &str,
+    os_version: &str,
+) -> Result<Vec<Value>, String> {
+    let spec = embedded_prompt_spec()?;
+    let cli_prefix = spec
+        .get("cliPrefix")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or("zcode_system.json 缺 cliPrefix")?;
+    let stable: Vec<&str> = spec
+        .get("stableSections")
+        .and_then(Value::as_array)
+        .ok_or("zcode_system.json 缺 stableSections")?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    if stable.len() < 2 {
+        return Err("zcode_system.json stableSections 少于 2 段".into());
+    }
+
+    let mut dynamic: Vec<String> = Vec::new();
+    if let Some(s) = spec.get("dynamicBehavior").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+        dynamic.push(s.to_string());
+    }
+    if has_skill {
+        if let Some(s) = spec.get("sessionGuidance").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+            dynamic.push(s.to_string());
+        }
+    }
+    dynamic.push(build_environment_text(&spec, platform, os_version));
+    if let Some(m) = model.map(str::trim).filter(|m| !m.is_empty()) {
+        if let Some(p) = spec.get("poweredBy").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+            dynamic.push(p.replace("{provider}", "zai-api").replace("{model}", m));
+        }
+    }
+    if let Some(s) = spec.get("contextManagement").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+        dynamic.push(s.to_string());
+    }
+    dynamic.extend(normalize_user_system(caller));
+
+    let cached = |text: String| {
+        json!({
+            "type": "text",
+            "text": text,
+            "cache_control": { "type": "ephemeral" }
+        })
+    };
+    Ok(vec![
+        cached(cli_prefix.to_string()),
+        cached(stable.join("\n\n")),
+        cached(format!("\n\n{}", dynamic.join("\n\n"))),
+    ])
+}
 
 pub fn system_blocks(paths: &Paths) -> Result<Vec<Value>, String> {
     let override_path = paths.store_dir().join(OVERRIDE_NAME);
@@ -29,10 +148,15 @@ pub fn system_blocks(paths: &Paths) -> Result<Vec<Value>, String> {
         {
             Some(b) => match validate(&b) {
                 Ok(()) => return Ok(b),
-                Err(e) => eprintln!("[prompt] 覆盖文件不合规（{e}），改从 ZCode 抽取"),
+                Err(e) => eprintln!("[prompt] 覆盖文件已过期或不合规（{e}），改用内嵌对齐提示词"),
             },
-            None => eprintln!("[prompt] 覆盖文件不是合法 JSON 数组，改从 ZCode 抽取"),
+            None => eprintln!("[prompt] 覆盖文件不是合法 JSON 数组，改用内嵌对齐提示词"),
         }
+    }
+
+    if let Ok(blocks) = build_start_plan_system(None, None, false, "win32-x64", "10.0.26200") {
+        let _ = cache_write(&override_path, &serde_json::to_string(&Value::Array(blocks.clone())).unwrap_or_default());
+        return Ok(blocks);
     }
 
     match extract_from_zcode(paths) {
@@ -61,10 +185,10 @@ fn cache_write(path: &Path, body: &str) -> Result<(), String> {
 }
 
 fn validate(blocks: &[Value]) -> Result<(), String> {
-    if blocks.len() != 2 {
-        return Err(format!("block 数应为 2，实为 {}", blocks.len()));
+    if !(2..=3).contains(&blocks.len()) {
+        return Err(format!("block 数应为 2 或 3，实为 {}", blocks.len()));
     }
-    let mut texts: Vec<String> = Vec::with_capacity(2);
+    let mut texts: Vec<String> = Vec::with_capacity(blocks.len());
     for (i, b) in blocks.iter().enumerate() {
         let o = b.as_object().ok_or(format!("block {i} 不是对象"))?;
         if o.get("type").and_then(Value::as_str) != Some("text") {
@@ -86,10 +210,12 @@ fn validate(blocks: &[Value]) -> Result<(), String> {
     }
 
     if texts[0] != PROMPT_PREFIX {
-        return Err(format!(
-            "block0 不等于固定前缀（实得 {} 字符）",
-            texts[0].chars().count()
-        ));
+        let stale_msg = if texts[0] == LEGACY_PROMPT_PREFIX {
+            "检测到旧版 interactive coding agent 缓存".to_string()
+        } else {
+            format!("block0 不等于对齐前缀（实得 {} 字符）", texts[0].chars().count())
+        };
+        return Err(stale_msg);
     }
 
     for (i, t) in texts.iter().enumerate() {
@@ -100,13 +226,14 @@ fn validate(blocks: &[Value]) -> Result<(), String> {
         }
     }
 
-    if !texts[1].trim_start().starts_with(IDENTITY_PREFIX) {
-        let head: String = texts[1].trim_start().chars().take(40).collect();
+    let head1 = texts[1].trim_start();
+    if !head1.starts_with(IDENTITY_PREFIX) && !head1.starts_with(LEGACY_IDENTITY_PREFIX) {
+        let head: String = head1.chars().take(40).collect();
         return Err(format!("block1 不以身份段开头（实得 {head:?}）"));
     }
     let l1 = texts[1].chars().count();
-    if !(800..=8000).contains(&l1) {
-        return Err(format!("block1 长度 {l1} 不在 [800,8000]"));
+    if !(800..=12000).contains(&l1) {
+        return Err(format!("block1 长度 {l1} 不在 [800,12000]"));
     }
     Ok(())
 }
@@ -1782,4 +1909,39 @@ fn split_top_commas(s: &str) -> Vec<String> {
     }
     out.push(buf);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn start_plan_system_has_strict_three_blocks_and_merges_caller_inside_block2() {
+        let caller = json!([
+            { "type": "text", "text": "You are a helpful assistant." }
+        ]);
+        let blocks = build_start_plan_system(
+            Some(&caller),
+            Some("GLM-5.4"),
+            true,
+            "win32-x64",
+            "10.0.26200",
+        )
+        .unwrap();
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0]["text"].as_str(), Some("You are ZCode, an interactive agent"));
+        assert!(blocks[1]["text"].as_str().unwrap().contains("ZCode Desktop Context"));
+        let b2 = blocks[2]["text"].as_str().unwrap();
+        assert!(b2.contains("# Session-specific guidance"));
+        assert!(b2.contains("You are powered by the model named zai-api/GLM-5.4."));
+        assert!(b2.ends_with("You are a helpful assistant."));
+        assert!(validate(&blocks).is_ok());
+
+        // Ensure stale Oct 8 "interactive coding agent" cache fails validation
+        let stale = vec![
+            json!({ "type": "text", "text": LEGACY_PROMPT_PREFIX, "cache_control": { "type": "ephemeral" } }),
+            json!({ "type": "text", "text": format!("\n{LEGACY_IDENTITY_PREFIX} {}", "x".repeat(900)), "cache_control": { "type": "ephemeral" } }),
+        ];
+        assert!(validate(&stale).is_err());
+    }
 }

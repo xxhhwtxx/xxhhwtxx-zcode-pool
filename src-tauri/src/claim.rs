@@ -112,11 +112,7 @@ fn claim_token(creds: &Value, config: Option<&Value>, secret: &str) -> Result<St
 }
 
 fn decrypt_credential(v: &str, secret: &str) -> Option<String> {
-    if zcrypto::is_encrypted(v) {
-        zcrypto::decrypt_with_secret(v, secret).ok()
-    } else {
-        Some(v.to_string())
-    }
+    zcrypto::decrypt_value_with_secret_or_v2(v, secret).ok()
 }
 
 fn agent() -> ureq::Agent {

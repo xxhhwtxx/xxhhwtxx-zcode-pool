@@ -61,15 +61,40 @@ fn init_flow_at(url: &str, provider: &str, mid: &str) -> Result<FlowInit, String
         .timeout_connect(Duration::from_secs(10))
         .timeout(Duration::from_secs(20))
         .build();
-    let mut req = agent.post(url);
-    for (k, v) in quota::zai_oauth_headers_with_mid(&poll_token, Some(mid.to_string())).0 {
-        req = req.set(&k, &v);
+    let headers = quota::zai_oauth_headers_with_mid(&poll_token, Some(mid.to_string())).0;
+    let mut resp_opt: Option<String> = None;
+    let mut last_err = String::new();
+    for attempt in 0..3 {
+        let mut req = agent.post(url);
+        for (k, v) in &headers {
+            req = req.set(k, v);
+        }
+        match req.send_json(json!({ "provider": provider })) {
+            Ok(r) => match r.into_string() {
+                Ok(s) => {
+                    resp_opt = Some(s);
+                    break;
+                }
+                Err(e) => last_err = e.to_string(),
+            },
+            Err(ureq::Error::Status(code, r)) => {
+                let body = r.into_string().unwrap_or_default();
+                let msg = if body.is_empty() {
+                    format!("HTTP {code}")
+                } else {
+                    format!("HTTP {code}: {body}")
+                };
+                return Err(crate::i18n::trf("err.oauth.init", &[("e", &msg)]));
+            }
+            Err(ureq::Error::Transport(t)) => {
+                last_err = t.to_string();
+            }
+        }
+        if attempt < 2 {
+            std::thread::sleep(Duration::from_millis(if attempt == 0 { 300 } else { 800 }));
+        }
     }
-    let resp = req
-        .send_json(json!({ "provider": provider }))
-        .map_err(|e| crate::i18n::trf("err.oauth.init", &[("e", &e.to_string())]))?
-        .into_string()
-        .map_err(|e| crate::i18n::trf("err.oauth.init", &[("e", &e.to_string())]))?;
+    let resp = resp_opt.ok_or_else(|| crate::i18n::trf("err.oauth.init", &[("e", &last_err)]))?;
     let v: Value = serde_json::from_str(&resp).unwrap_or(Value::String(resp));
     let invalid = || crate::i18n::tr("err.oauth.init_invalid");
     if v.get("code").and_then(|c| c.as_i64()) != Some(0) {
@@ -709,4 +734,21 @@ pub fn assemble_config(provider: &str, jwt: &str, access_token: &str) -> Value {
         _ => {}
     }
     json!({ "provider": providers })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::assemble_config;
+
+    #[test]
+    fn assemble_config_zai_without_business_token_keeps_start_plan_enabled() {
+        let cfg = assemble_config("zai", "jwt_tok", "");
+        let start = cfg.pointer("/provider/builtin:zai-start-plan").unwrap();
+        assert_eq!(start.get("enabled").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(start.pointer("/options/apiKey").and_then(|v| v.as_str()), Some("jwt_tok"));
+
+        let coding = cfg.pointer("/provider/builtin:zai-coding-plan").unwrap();
+        assert_eq!(coding.get("enabled").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(coding.pointer("/options/apiKey").and_then(|v| v.as_str()), Some(""));
+    }
 }

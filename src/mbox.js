@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { t } from "./i18n.js";
 import { ic } from "./icons.js";
 import { esc, toast, openLineModal } from "./ui.js";
-import { regStart, regBatchSet } from "./reg.js";
+import { regStartBatch, regBindFlow, regRemoveBatch, regClose } from "./reg.js";
 
 let rerender = () => {};
 export function setMboxRerender(fn) {
@@ -11,13 +11,32 @@ export function setMboxRerender(fn) {
 
 const tr = (group, key) => t(`${group}.${key}`);
 
+const CONCURRENCY_OPTS = [1, 2, 3, 4, 5, 6, 8, 10, 12, 14];
+function loadSavedConcurrency() {
+  try {
+    const v = Number(localStorage.getItem("zpool.mboxConcurrency"));
+    if (CONCURRENCY_OPTS.includes(v)) return v;
+  } catch {}
+  return 3;
+}
+
 const M = {
   list: [],
   filter: "all",
   sel: new Set(),
-  batch: { running: false, queue: [], total: 0, done: 0, current: "", results: [] },
+  concurrency: loadSavedConcurrency(),
+  batch: { running: false, queue: [], active: new Map(), total: 0, done: 0, current: "", results: [], concurrency: 1 },
   lastRun: null,
 };
+
+export function mboxSetConcurrency(n) {
+  const v = Number(n);
+  M.concurrency = CONCURRENCY_OPTS.includes(v) ? v : 3;
+  try {
+    localStorage.setItem("zpool.mboxConcurrency", String(M.concurrency));
+  } catch {}
+  rerender();
+}
 
 export function mboxRunning() {
   return M.batch.running;
@@ -109,6 +128,12 @@ export function mboxPage() {
       <button class="btn p" click="actions.mboxImport()" ${b.running ? "disabled" : ""}>${ic("import", 15)} ${t("mb.import")}</button>
       <button class="btn" click="actions.mboxExport()" ${M.list.length && !b.running ? "" : "disabled"}>${ic("export", 14)} ${t("mb.export")}</button>
       <button class="btn" click="actions.mboxVerify()" ${!M.sel.size || b.running ? "disabled" : ""}>${ic("play", 14)} ${t("mb.verify")}${M.sel.size ? ` (${M.sel.size})` : ""}</button>
+      <label class="mb-conc" title="${esc(t("mb.concTitle"))}">
+        <span>${esc(t("mb.concLabel"))}</span>
+        <select id="mb-conc-sel" class="inp sm" ${b.running ? "disabled" : ""}>
+          ${CONCURRENCY_OPTS.map((n) => `<option value="${n}" ${M.concurrency === n ? "selected" : ""}>${esc(t("mb.concOpt", { n }))}</option>`).join("")}
+        </select>
+      </label>
       <button class="btn" click="actions.mboxStop()" ${b.running ? "" : "disabled"}>${ic("power", 14)} ${t("mb.stop")}</button>
       <span class="spacer"></span>
       <button class="btn d" click="actions.mboxDelete()" ${M.sel.size && !b.running ? "" : "disabled"}>${ic("trash", 14)} ${t("mb.delete")}${M.sel.size ? ` (${M.sel.size})` : ""}</button>
@@ -151,10 +176,8 @@ export function mboxPage() {
 }
 
 function selAllOn(rows) {
-  const newOnes = rows.filter((a) => a.status === "new");
-  return newOnes.length > 0 && newOnes.every((a) => M.sel.has(a.email));
+  return rows.length > 0 && rows.every((a) => M.sel.has(a.email));
 }
-
 
 export function mboxFilter(f) {
   M.filter = f;
@@ -169,7 +192,6 @@ export function mboxToggle(email, on) {
 export function mboxSelectAll(on) {
   if (M.batch.running) return;
   for (const a of filtered()) {
-    if (a.status !== "new") continue;
     if (on) M.sel.add(a.email);
     else M.sel.delete(a.email);
   }
@@ -325,49 +347,115 @@ export async function mboxReauth(email) {
   setTimeout(tick, 1500);
 }
 
-
 export async function mboxVerify() {
   const emails = [...M.sel].filter((e) => {
     const a = M.list.find((x) => x.email === e);
-    return a && a.status === "new";
+    return a && a.status !== "verified";
   });
   if (!emails.length) {
     toast(t("mb.nothingToVerify"), "warn");
     return;
   }
-  M.batch = { running: true, queue: emails.slice(), total: emails.length, done: 0, current: "", results: [] };
+  const conc = Math.max(1, Math.min(14, Number(M.concurrency) || 1));
+  regClose();
+  M.batch = {
+    running: true,
+    queue: emails.slice(),
+    active: new Map(),
+    total: emails.length,
+    done: 0,
+    current: "",
+    results: [],
+    concurrency: conc,
+  };
   rerender();
-  runNext();
+  const slots = Math.min(conc, emails.length);
+  for (let slot = 0; slot < slots; slot++) {
+    if (slot === 0) launchSlot(slot);
+    else setTimeout(() => launchSlot(slot), slot * 100);
+  }
 }
 
-async function runNext() {
+async function launchSlot(slot) {
   const b = M.batch;
   if (!b.running) return;
-  if (!b.queue.length) return finishBatch();
+  if (!b.queue.length) {
+    if (b.active.size === 0) finishBatch();
+    return;
+  }
   const email = b.queue.shift();
-  b.current = email;
+  const entry = { email, slot, flow: "" };
+  b.active.set(email, entry);
+  b.current = [...b.active.keys()].join(", ");
   rerender();
   try {
-    regStart("register", "zai");
-    regBatchSet(email);
-    await invoke("oauth_begin", { provider: "zai", mode: "register", batch: true });
+    regStartBatch(email, "zai");
+    const res = await invoke("oauth_begin", {
+      provider: "zai",
+      mode: "register",
+      batch: true,
+      email,
+      slot,
+      concurrency: b.concurrency,
+    });
+    if (res && res.flow) {
+      entry.flow = res.flow;
+      regBindFlow(email, res.flow);
+    }
   } catch (e) {
+    if (!b.running || !b.active.has(email)) return;
+    b.active.delete(email);
+    regRemoveBatch(email);
+    b.current = [...b.active.keys()].join(", ");
     const msg = String(e).replace(/^[a-z_]+:/, "");
     b.done += 1;
     b.results.push({ email, ok: false, error: msg });
     await invoke("pool_mark_verified", { email, ok: false, note: msg }).catch(() => {});
-    setTimeout(runNext, 400);
+    await mboxLoad();
+    rerender();
+    setTimeout(() => launchSlot(slot), 400);
   }
 }
 
-export function mboxOnOauthDone(email, ok, note) {
+function findActiveEntry(email, flow) {
   const b = M.batch;
-  if (!b.running || !email) return false;
+  if (!b.active || !b.active.size) return null;
+  if (email) {
+    if (b.active.has(email)) return b.active.get(email);
+    const low = String(email).toLowerCase();
+    for (const v of b.active.values()) {
+      if (v.email.toLowerCase() === low) return v;
+    }
+  }
+  if (flow) {
+    for (const v of b.active.values()) {
+      if (v.flow === flow) return v;
+    }
+  }
+  return b.active.values().next().value || null;
+}
+
+export function mboxOnOauthDone(email, ok, note, flow) {
+  const b = M.batch;
+  if (!b.running) return false;
+  const entry = findActiveEntry(email, flow);
+  const targetEmail = entry ? entry.email : email;
+  if (!targetEmail) return false;
+  const slot = entry ? entry.slot : 0;
+  if (entry) b.active.delete(entry.email);
+  regRemoveBatch(targetEmail);
+  b.current = [...b.active.keys()].join(", ");
   b.done += 1;
-  b.results.push({ email, ok, error: note || "" });
-  invoke("pool_mark_verified", { email, ok, note: note || null }).catch(() => {});
+  b.results.push({ email: targetEmail, ok, error: note || "" });
+  invoke("pool_mark_verified", { email: targetEmail, ok, note: note || null }).catch(() => {});
   mboxLoad().then(rerender);
-  setTimeout(runNext, 900);
+  if (b.queue.length > 0) {
+    setTimeout(() => launchSlot(slot), 600);
+  } else if (b.active.size === 0) {
+    setTimeout(() => {
+      if (b.running && b.queue.length === 0 && b.active.size === 0) finishBatch();
+    }, 400);
+  }
   return true;
 }
 
@@ -375,38 +463,51 @@ export function mboxStop() {
   const b = M.batch;
   if (!b.running) return;
   b.running = false;
+  b.queue = [];
+  b.active.clear();
   b.current = "";
-  regBatchSet("");
-  invoke("reg_close_window").catch(() => {});
+  regClose();
+  invoke("reg_close_window", { flow: null, email: null }).catch(() => {});
   toast(t("mb.batch.stopped"), "warn");
   rerender();
 }
 
-export function mboxSkipCurrent() {
+export function mboxSkipCurrent(targetEmail) {
   const b = M.batch;
-  if (!b.running || !b.current) {
+  const entry = findActiveEntry(targetEmail, null);
+  if (!b.running || !entry) {
     toast(t("mb.batch.noCurrent"), "warn");
     return;
   }
-  const email = b.current;
-  b.current = "";
+  const email = entry.email;
+  const slot = entry.slot;
+  const flow = entry.flow;
+  b.active.delete(email);
+  regRemoveBatch(email);
+  b.current = [...b.active.keys()].join(", ");
   b.done += 1;
   const note = t("mb.batch.skipped");
   b.results.push({ email, ok: false, error: note });
   invoke("pool_mark_verified", { email, ok: false, note }).catch(() => {});
-  regBatchSet("");
-  invoke("reg_close_window").catch(() => {});
+  invoke("reg_close_window", { flow: flow || null, email }).catch(() => {});
   toast(t("mb.batch.skippedToast", { email }), "warn");
   mboxLoad().then(rerender);
-  setTimeout(runNext, 600);
+  if (b.queue.length > 0) {
+    setTimeout(() => launchSlot(slot), 500);
+  } else if (b.active.size === 0) {
+    setTimeout(() => {
+      if (b.running && b.queue.length === 0 && b.active.size === 0) finishBatch();
+    }, 400);
+  }
 }
 
 function finishBatch() {
   const b = M.batch;
   const ok = b.results.filter((r) => r.ok).length;
   b.running = false;
+  b.active.clear();
   b.current = "";
-  regBatchSet("");
+  regClose();
   M.lastRun = { total: b.total, results: b.results.slice() };
   toast(t("mb.batch.done", { ok, total: b.total }), ok === b.total ? "ok" : "warn");
   rerender();

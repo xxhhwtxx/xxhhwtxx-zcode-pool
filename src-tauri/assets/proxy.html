@@ -910,7 +910,7 @@ function seg(items, cur, act) {
 }
 function viewPolicy() {
   const s = S || {};
-  const cur = s.policy || "expire_first", mm = s.modelMode || "follow";
+  const cur = s.policy || "expire_first", mm = s.modelMode || "auto";
   return '<div class="panel"><h2>选号策略</h2><div class="body">' + seg(POLICY, cur, "policy") +
     (cur === "pinned"
       ? '<div class="kv" style="margin-top:14px"><span class="k">指定账号</span>' +
@@ -938,7 +938,7 @@ function viewPolicy() {
       '<div class="copy" style="max-width:190px"><input id="mfrom" class="mono" placeholder="客户端要的，如 GLM-5.2" ' +
       'style="background:none;border:0;color:var(--fg);width:100%;outline:none;font:12px/1.4 ui-monospace,monospace"></div>' +
       '<span style="color:var(--dim2)">→</span>' +
-      '<div class="copy" style="max-width:190px"><input id="mto" class="mono" placeholder="上游的，如 GLM-5.3" ' +
+      '<div class="copy" style="max-width:190px"><input id="mto" class="mono" placeholder="上游的，如 GLM-5.4" ' +
       'style="background:none;border:0;color:var(--fg);width:100%;outline:none;font:12px/1.4 ui-monospace,monospace"></div>' +
       '<button class="mini pri" data-mmadd>' + ICON("plus", 14) + '加</button></div>' +
     Object.entries(s.modelMap || {}).map(([f, t]) =>
@@ -955,7 +955,7 @@ function viewSettings() {
   const s = S || {}, m = s.mint || {};
   const port = s.port || 8899;
   const on = !!s.external;
-  const curl = 'curl ' + location.origin + '/v1/messages -H "content-type: application/json" -d \'{"model":"GLM-5.3-Flash","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}\'';
+  const curl = 'curl ' + location.origin + '/v1/messages -H "content-type: application/json" -d \'{"model":"GLM-5.4","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}\'';
   return `
   <div class="panel">
     <h2>服务 <span class="grow"></span><span class="tag ${on ? "ok" : "dim"}">${on ? "运行中" : "已停止"}</span></h2>
@@ -1171,7 +1171,7 @@ function pctUsed(it) {
 
 function qbarHtml(used, tip) {
   const cls = used == null ? "" : used >= 90 ? " danger" : used >= 70 ? " warn" : "";
-  const rem = used == null ? 100 : 100 - used;
+  const rem = used == null ? 0 : 100 - used;
   const txt = used == null ? "--" : rem.toFixed(0) + "%";
   const tt = tip ? ' title="' + esc(tip) + '"' : "";
   return '<span class="qbar' + cls + '"' + tt + '><i style="width:' + rem + '%"></i></span><span class="qpct">' + txt + "</span>";
@@ -1367,14 +1367,14 @@ function quotaSummaryInner() {
     sumRemain += snap(m.remaining || 0);
   }
   const hasTotal = sumTotal > 0;
-  const sumPct = hasTotal ? (sumRemain / sumTotal) * 100 : 100;
+  const sumPct = hasTotal ? (sumRemain / sumTotal) * 100 : 0;
   const bigCls = " big" + (hasTotal ? (sumPct <= 10 ? " danger" : sumPct <= 30 ? " warn" : "") : "");
   const models = [...byModel.entries()]
     .sort((a, b) => (b[1].total || 0) - (a[1].total || 0))
     .slice(0, 8);
   const mgauges = models.map(([k, m]) => {
     const known = m.hasT && m.total > 0;
-    const pct = known ? (m.remaining / m.total) * 100 : 100;
+    const pct = known ? (m.remaining / m.total) * 100 : 0;
     const cls = known ? (pct <= 10 ? " danger" : pct <= 30 ? " warn" : "") : "";
     return '<div class="mgauge">' +
       gaugeSvg(pct, m.hasT ? fmtTok(m.remaining) : "—", m.hasT ? fmtTok(m.total) : "", cls,
